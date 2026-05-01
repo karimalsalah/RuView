@@ -18,6 +18,11 @@ jobs:
   code-quality:
     name: Code Quality & Security
     runs-on: ubuntu-latest
+    # Skip when there's no Python source at the root `src/` to lint. The
+    # active codebase is the Rust workspace under `v2/`; legacy Python
+    # lives at `archive/v1/src/` and is not part of CI gating. If `src/`
+    # is reintroduced this job will run automatically.
+    if: hashFiles('src/**/*.py') != ''
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -70,6 +75,16 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
 
+    - name: Install system dependencies
+      # glib-sys (transitive via gstreamer/gtk crates in the workspace)
+      # needs glib-2.0 + pkg-config at build time. Without these the
+      # workspace build fails: "failed to run custom build command for
+      # `glib-sys vN.M.K`".
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          pkg-config libglib2.0-dev
+
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
 
@@ -92,6 +107,10 @@ jobs:
   test:
     name: Tests
     runs-on: ubuntu-latest
+    # Skip when there's no Python test suite under `tests/unit/` /
+    # `tests/integration/` to run. The legacy Python tests have been
+    # archived under `archive/v1/tests/` and are not part of CI gating.
+    if: hashFiles('tests/unit/**/*.py') != '' || hashFiles('tests/integration/**/*.py') != ''
     strategy:
       matrix:
         python-version: ['3.10', '3.11', '3.12']
