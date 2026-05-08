@@ -1,16 +1,27 @@
 # ESP-IDF component manifest for the ruv_temporal Rust staticlib (ADR-095).
 #
 # Build flow:
-#   1. Run `cargo +esp build --release --target xtensa-esp32s3-none-elf` in
-#      this directory. Output: target/xtensa-esp32s3-none-elf/release/libruv_temporal.a
-#   2. Register the resulting static library and the public header dir
-#      with idf_component_register so it shows up on the firmware's
-#      include path and link line.
+#   - When CONFIG_CSI_TEMPORAL_HEAD_ENABLED is OFF (default): register an
+#     empty stub. main/temporal_task.c compiles the no-op shim path, no
+#     cargo, no Rust toolchain dependency. Default firmware build is
+#     unaffected.
+#   - When CONFIG_CSI_TEMPORAL_HEAD_ENABLED is ON: invoke
+#     `cargo +esp build --release --target xtensa-esp32s3-none-elf`,
+#     register the resulting libruv_temporal.a, and expose include/.
 #
-# Phase 4: scaffold only — registered but no kernel work runs yet.
-# Phase 5: cross-compile validated, binary delta measured.
-# Phase 6: enabled via CONFIG_CSI_TEMPORAL_HEAD_ENABLED Kconfig flag and
-#          fed from edge_processing.c.
+# add_custom_command is intentionally placed AFTER idf_component_register
+# because ESP-IDF runs every component's CMakeLists.txt twice — once in
+# script mode for dependency discovery (where add_custom_command is
+# forbidden), and once for the actual build.
+
+if(NOT CONFIG_CSI_TEMPORAL_HEAD_ENABLED)
+    # Feature disabled — register an empty component so the directory's
+    # mere existence doesn't break the build, but do NOT invoke cargo
+    # or pull include/ onto consumers' include paths (the C ABI header
+    # would advertise capabilities we cannot honour).
+    idf_component_register()
+    return()
+endif()
 
 set(RUV_TEMPORAL_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
 set(RUV_TEMPORAL_TARGET "xtensa-esp32s3-none-elf")
@@ -18,9 +29,13 @@ set(RUV_TEMPORAL_PROFILE "release")
 set(RUV_TEMPORAL_LIB
     "${RUV_TEMPORAL_DIR}/target/${RUV_TEMPORAL_TARGET}/${RUV_TEMPORAL_PROFILE}/libruv_temporal.a")
 
-# Run the cargo build as a custom command. ESP-IDF's CMake runs at
-# configure time; we want the staticlib to exist before idf_component_register
-# runs so it can be added as INTERFACE_LINK_LIBRARIES.
+idf_component_register(
+    SRCS "shim.c"
+    INCLUDE_DIRS "include"
+    PRIV_REQUIRES "esp_common"
+)
+
+# Custom command + target run only at build time, not in script mode.
 add_custom_command(
     OUTPUT "${RUV_TEMPORAL_LIB}"
     WORKING_DIRECTORY "${RUV_TEMPORAL_DIR}"
@@ -30,12 +45,5 @@ add_custom_command(
 )
 add_custom_target(ruv_temporal_rust_build ALL DEPENDS "${RUV_TEMPORAL_LIB}")
 
-idf_component_register(
-    SRCS "shim.c"                # tiny C shim so idf_component_register has a SRCS
-    INCLUDE_DIRS "include"
-    PRIV_REQUIRES "esp_common"
-)
-
-# Wire the staticlib in.
 add_dependencies(${COMPONENT_LIB} ruv_temporal_rust_build)
 target_link_libraries(${COMPONENT_LIB} INTERFACE "${RUV_TEMPORAL_LIB}")
