@@ -77,6 +77,11 @@ jobs:
         with:
           workspaces: v2 -> target
 
+      - name: Validate HA Blueprints
+        run: |
+          python -m pip install --quiet pyyaml
+          python scripts/validate-ha-blueprints.py
+
       - name: Verify unit tests still pass under --features mqtt
         working-directory: v2
         # `cargo test` accepts a single TESTNAME filter, so we run the
