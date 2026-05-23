@@ -365,6 +365,38 @@ class TestSyncPacketParser:
         assert sync_magic == SyncPacketParser.MAGIC
         assert csi_magic != sync_magic
 
+    def test_apply_to_local_recovers_epoch_at_sync_point(self):
+        """ADR-110 iter 26 — Python parity with Rust's `apply_to_local`.
+        At local_at_frame == sync.local_us, the recovered mesh time must
+        equal sync.epoch_us exactly."""
+        pkt = SyncPacketParser.parse(build_sync_packet(
+            local_us=28_798_450, epoch_us=27_634_885, sequence=20,
+        ))
+        assert pkt.apply_to_local(pkt.local_us) == pkt.epoch_us
+        assert pkt.local_minus_epoch_us() == 1_163_565  # §A0.10's bench number
+
+    def test_apply_to_local_preserves_inter_frame_delta(self):
+        """A frame arriving 5 s after the sync packet on the follower's
+        local clock must produce a mesh time exactly 5 s after sync.epoch_us."""
+        pkt = SyncPacketParser.parse(build_sync_packet(
+            local_us=28_798_450, epoch_us=27_634_885, sequence=20,
+        ))
+        local_at_frame = pkt.local_us + 5_000_000
+        assert pkt.apply_to_local(local_at_frame) == pkt.epoch_us + 5_000_000
+
+    def test_mesh_aligned_us_for_sequence_matches_rust(self):
+        """Cross-language parity with Rust's
+        `end_to_end_sync_decode_then_frame_mesh_recovery` test —
+        100 frames after sync.sequence at 20 fps = sync.epoch_us + 5 s."""
+        pkt = SyncPacketParser.parse(build_sync_packet(
+            local_us=28_798_450, epoch_us=27_634_885, sequence=20,
+        ))
+        mesh = pkt.mesh_aligned_us_for_sequence(120, 20.0)
+        assert mesh == pkt.epoch_us + 5_000_000
+        # Both paths (apply_to_local + interpolation) must agree
+        local_at = pkt.local_us + 5_000_000
+        assert pkt.apply_to_local(local_at) == mesh
+
     def test_canonical_wire_bytes_match_rust_decoder(self):
         """ADR-110 iter 21 — cross-language wire-format conformance gate.
 

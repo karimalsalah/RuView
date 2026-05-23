@@ -284,6 +284,48 @@ class SyncPacket:
     sequence: int       # u32 — high-water CSI sequence at emit time
     flags_raw: int
 
+    def local_minus_epoch_us(self) -> int:
+        """Signed local-vs-mesh clock offset in µs.
+
+        Negative when this node's clock is behind the leader's (typical
+        for followers). Equal to ≈0 on the leader (modulo call-stack µs).
+        Matches Rust's `SyncPacket::local_minus_epoch_us` byte-for-byte.
+        """
+        return self.local_us - self.epoch_us
+
+    def apply_to_local(self, local_at_frame_us: int) -> int:
+        """Recover a mesh-aligned timestamp for any node-local µs snapshot.
+
+        Math (see WITNESS-LOG-110 §A0.10 / §A0.12):
+            offset = epoch_us - local_us           (signed; this packet)
+            mesh   = local_at_frame_us + offset
+
+        Identical contract to Rust's `SyncPacket::apply_to_local`.
+        Identity at `local_at_frame_us == self.local_us` returns `epoch_us`.
+        """
+        offset = self.epoch_us - self.local_us
+        return local_at_frame_us + offset
+
+    def mesh_aligned_us_for_sequence(self, frame_seq: int, fps_hz: float) -> int:
+        """ADR-110 §A0.12 — recover the mesh-aligned timestamp for an
+        in-flight CSI frame by its sequence number.
+
+        Pairs the frame's sequence number against this sync packet's
+        sequence high-water + an assumed/measured CSI rate. Matches the
+        Rust implementation byte-for-byte at the integer level (Python
+        rounds via `int()` truncation; for the canonical bench values
+        this is exact).
+        """
+        if fps_hz <= 0:
+            raise ValueError(f"fps_hz must be positive, got {fps_hz}")
+        # Wrap to handle u32 sequence overflow the same way Rust does.
+        dframes = (frame_seq - self.sequence) & 0xFFFFFFFF
+        if dframes >= 0x80000000:
+            dframes -= 0x1_0000_0000
+        dus = int(dframes * 1_000_000 / fps_hz)
+        local_at = self.local_us + dus
+        return self.apply_to_local(local_at)
+
 
 class SyncPacketParser:
     """Parser for ADR-110 §A0.12 32-byte sync packets.
