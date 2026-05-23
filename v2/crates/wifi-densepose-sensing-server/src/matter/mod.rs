@@ -29,8 +29,12 @@
 //! would expand `EntityKind::matter_mapping` to cover them. Today HR /
 //! BR have no Matter cluster and stay MQTT-only.
 
+mod bridge;
 mod clusters;
+mod commissioning;
 
+pub use bridge::{build_bridge_tree, BridgeTree, Endpoint, EndpointRef, NodeBranch};
 pub use clusters::{
     matter_mapping, ClusterId, EndpointTypeId, MatterClusterMapping,
 };
+pub use commissioning::{ManualPairingCode, SetupCodeInput};
