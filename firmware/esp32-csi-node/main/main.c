@@ -36,6 +36,7 @@
 #include "c6_twt.h"                /* ADR-110: TWT (no-op stub on S3) */
 #include "c6_timesync.h"           /* ADR-110: 802.15.4 mesh time-sync (no-op on S3) */
 #include "c6_lp_core.h"            /* ADR-110: LP-core hibernation (no-op on S3) */
+#include "c6_sync_espnow.h"        /* ADR-110 D1 workaround: ESP-NOW sync */
 #ifdef CONFIG_CSI_MOCK_ENABLED
 #include "mock_csi.h"
 #endif
@@ -252,6 +253,18 @@ void app_main(void)
      * Called only after WiFi STA connect (wifi_init_sta blocks until then). */
 #if defined(CONFIG_IDF_TARGET_ESP32C6) && defined(CONFIG_C6_TWT_ENABLE)
     c6_twt_setup_default();
+#endif
+
+    /* ADR-110 D1 workaround: ESP-NOW cross-node sync. Initialized after
+     * WiFi STA connects (ESP-NOW needs the WiFi driver up). Works on
+     * both S3 and C6 — replaces the broken 802.15.4 RX path in c6_timesync.
+     * Skip on QEMU mock (no real WiFi → no ESP-NOW). */
+#ifndef CONFIG_CSI_MOCK_SKIP_WIFI_CONNECT
+    esp_err_t espnow_ret = c6_sync_espnow_init();
+    if (espnow_ret != ESP_OK) {
+        ESP_LOGW(TAG, "c6_sync_espnow_init failed: %s (continuing without ESP-NOW sync)",
+                 esp_err_to_name(espnow_ret));
+    }
 #endif
 
     /* ADR-039: Initialize edge processing pipeline. */

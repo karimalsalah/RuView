@@ -13,6 +13,8 @@ set(SRCS
     "c6_twt.c"
     "c6_timesync.c"
     "c6_lp_core.c"
+    # ADR-110 D1 workaround — ESP-NOW cross-node sync (works on S3+C6)
+    "c6_sync_espnow.c"
 )
 
 # ESP-IDF v6+: headers must resolve via explicit REQUIRES (no implicit deps).

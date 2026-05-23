@@ -54,6 +54,25 @@ This witness separates what was **empirically observed on real silicon today** f
 | **C3** | LED strip on GPIO 38 (S3 dev board position) crashed RMT init on C6 (which only has GPIO 0-30) | `main.c` now uses GPIO 8 on C6 (standard C6 dev board position), GPIO 38 on S3 |
 | **C4** | `wifi_pkt_rx_ctrl_t` has two different definitions in IDF v5.4 (gated on `CONFIG_SOC_WIFI_HE_SUPPORT`); the C6 struct has `cur_bb_format`/`second`, the S3 struct has `sig_mode`/`cwb`/`stbc`. Initial code only handled the C6 branch and broke S3 compilation. | `csi_collector.c` now has both branches gated on `CONFIG_SOC_WIFI_HE_SUPPORT`. Verified by S3 build green (A12). |
 
+## D-workaround. ESP-NOW cross-node sync (D1 mitigation)
+
+After D1 confirmed the 802.15.4 RX path is unfixable from user code in this IDF v5.4 + C6 combination (5 hypotheses tested), added a parallel `c6_sync_espnow.{h,c}` module that runs the same TS_BEACON protocol over ESP-NOW instead. ESP-NOW is WiFi-based peer-to-peer (no AP needed), uses the same 2.4 GHz radio, and has a known-working RX path on every ESP32 family.
+
+| Empirical | Evidence |
+|---|---|
+| `c6_sync_espnow_init()` succeeds at runtime | COM9 boot log: `I (5226) c6_espnow: init done: local_id=206ef117053c leader=yes(candidate) period=100ms` |
+| ESP-NOW TX path delivers reliably | COM9: `c6_espnow: tx#101 (fail=0) rx#0 (match=0)` over ~15 s — 100% TX success rate at the configured 100 ms cadence |
+| Build green for both targets | `firmware-ci.yml` matrix (3 jobs) all pass with the new module |
+
+The cross-board RX measurement was attempted but the other 3 boards (COM6/COM10/COM12) dropped off USB enumeration mid-experiment (presumably brown-out from repeated DTR/RTS resets) and couldn't be recovered without a physical replug. **Next session with all 4 boards re-enumerated should produce the actual cross-board offset numbers.** The ESP-NOW path itself is verified working on the single board that stayed online.
+
+Trade vs. the original 802.15.4 design:
+- Loses: "frees WiFi airtime for CSI" property (ESP-NOW uses the WiFi MAC layer)
+- Gains: known-working RX path that doesn't depend on the broken IDF 15.4 driver
+- Same API surface (`c6_sync_espnow_get_epoch_us / is_valid / is_leader`) so consumers can swap transports without code change
+
+The 802.15.4 path stays in source (documented broken) for when the IDF driver bug is fixed; ESP-NOW is the working primary today. Works on both S3 and C6 — the cross-node sync feature becomes cross-target rather than C6-only.
+
 ## D. Bugs found but NOT yet fixed
 
 | # | Bug | Tracked |

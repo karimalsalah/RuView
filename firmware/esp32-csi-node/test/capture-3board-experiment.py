@@ -76,9 +76,13 @@ for port in PORTS:
     for L in grep_pattern(text, r'main: ESP32-C6.*Node ID', 2):
         print(f'  banner   : {L}')
 
-    # Time-sync init
+    # Time-sync init (802.15.4 path — known broken D1)
     for L in grep_pattern(text, r'c6_ts:.*(init done|promot|stepping down|tx fail)', 4):
         print(f'  c6_ts    : {L}')
+
+    # ESP-NOW sync (D1 workaround, working path)
+    for L in grep_pattern(text, r'c6_espnow:.*(init done|promot|stepping down|tx#\d)', 6):
+        print(f'  c6_espnow: {L}')
 
     # WiFi mode + connect status
     for L in grep_pattern(text, r'(wifi:mode|wifi:state|Retrying WiFi|got ip|Connected to WiFi)', 6):
