@@ -5704,6 +5704,85 @@ async fn main() {
 }
 
 #[cfg(test)]
+mod node_sync_snapshot_serialization_tests {
+    //! ADR-110 iter 24 — JSON public-API contract for the iter 23
+    //! NodeSyncSnapshot field. Any future rename / removal here must be
+    //! intentional and update both Rust + UI/automation consumers.
+
+    use super::*;
+
+    fn sample_sync() -> NodeSyncSnapshot {
+        NodeSyncSnapshot {
+            offset_us: 1_163_565,
+            is_leader: false,
+            is_valid: true,
+            smoothed: true,
+            sequence: 20,
+            csi_fps_ema: 10.0,
+            csi_fps_samples: 47,
+        }
+    }
+
+    fn sample_node(sync: Option<NodeSyncSnapshot>) -> NodeInfo {
+        NodeInfo {
+            node_id: 9,
+            rssi_dbm: -38.0,
+            position: [2.0, 0.0, 1.5],
+            amplitude: vec![],
+            subcarrier_count: 0,
+            sync,
+        }
+    }
+
+    #[test]
+    fn sync_present_serializes_all_seven_fields() {
+        let v = serde_json::to_value(sample_node(Some(sample_sync()))).unwrap();
+        let s = v.get("sync").expect("sync key must be present");
+        // All seven contract fields named exactly as iter 23 documented.
+        for key in ["offset_us", "is_leader", "is_valid", "smoothed",
+                    "sequence", "csi_fps_ema", "csi_fps_samples"] {
+            assert!(s.get(key).is_some(),
+                    "sync object missing field `{}` — UI contract broken", key);
+        }
+        // Spot-check values round-trip.
+        assert_eq!(s["offset_us"], 1_163_565);
+        assert_eq!(s["is_leader"], false);
+        assert_eq!(s["sequence"], 20);
+        assert_eq!(s["csi_fps_samples"], 47);
+    }
+
+    #[test]
+    fn sync_absent_omits_the_key_entirely() {
+        // skip_serializing_if = "Option::is_none" must drop the key, not
+        // emit `"sync": null`. The non-mesh paths rely on this for
+        // backwards compatibility with pre-iter-23 UI clients.
+        let v = serde_json::to_value(sample_node(None)).unwrap();
+        assert!(v.get("sync").is_none(),
+                "expected `sync` key omitted when None, got {:?}", v.get("sync"));
+        // The base NodeInfo fields are still there.
+        assert_eq!(v["node_id"], 9);
+        assert_eq!(v["rssi_dbm"], -38.0);
+    }
+
+    #[test]
+    fn sync_round_trips_through_serde() {
+        let original = sample_node(Some(sample_sync()));
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: NodeInfo = serde_json::from_str(&json).unwrap();
+        // Field-level equality on the sync sub-object.
+        let s_orig = original.sync.unwrap();
+        let s_parsed = parsed.sync.expect("sync should survive round-trip");
+        assert_eq!(s_parsed.offset_us, s_orig.offset_us);
+        assert_eq!(s_parsed.is_leader, s_orig.is_leader);
+        assert_eq!(s_parsed.is_valid, s_orig.is_valid);
+        assert_eq!(s_parsed.smoothed, s_orig.smoothed);
+        assert_eq!(s_parsed.sequence, s_orig.sequence);
+        assert!((s_parsed.csi_fps_ema - s_orig.csi_fps_ema).abs() < 1e-9);
+        assert_eq!(s_parsed.csi_fps_samples, s_orig.csi_fps_samples);
+    }
+}
+
+#[cfg(test)]
 mod novelty_tests {
     use super::*;
 
