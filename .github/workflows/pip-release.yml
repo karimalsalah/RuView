@@ -179,12 +179,18 @@ jobs:
       - name: Smoke-test tombstone in isolated venv
         run: |
           set -e
+          # Copy the wheel to /tmp BEFORE entering the venv — we must
+          # cd OUT of the repo root because the repo contains a
+          # `wifi_densepose/` directory left over from the legacy v1
+          # source. Python puts cwd at sys.path[0], so an import from
+          # the repo root would resolve to the legacy directory and
+          # bypass the freshly-installed wheel entirely (this was the
+          # silent failure mode of the previous two run attempts).
+          cp tombstone-dist/wifi_densepose-1.99.0-py3-none-any.whl /tmp/
           python -m venv /tmp/smoke-venv
           /tmp/smoke-venv/bin/python -m pip install --upgrade pip
-          /tmp/smoke-venv/bin/python -m pip install tombstone-dist/wifi_densepose-1.99.0-py3-none-any.whl
-          # Show where wifi_densepose actually resolved + that the file
-          # the venv would import is the tombstone, NOT something else
-          # on the path.
+          /tmp/smoke-venv/bin/python -m pip install /tmp/wifi_densepose-1.99.0-py3-none-any.whl
+          cd /tmp  # away from the repo root's stray wifi_densepose/
           /tmp/smoke-venv/bin/python -c "import importlib.util as u; s = u.find_spec('wifi_densepose'); print('Resolved to:', s.origin); print('--- file content ---'); print(open(s.origin).read())"
           set +e
           /tmp/smoke-venv/bin/python -c "import wifi_densepose" 2> import-output.txt
