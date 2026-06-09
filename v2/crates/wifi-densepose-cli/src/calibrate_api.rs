@@ -20,7 +20,7 @@
 //! `&mut` recorder lock-free and the API non-blocking. CORS is permissive so a
 //! browser UI served from any origin can call it during development.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -38,7 +38,9 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tower_http::cors::CorsLayer;
 use wifi_densepose_calibration::extract::{AnchorFeature, Features};
-use wifi_densepose_calibration::{MixtureOfSpecialists, SpecialistBank};
+use wifi_densepose_calibration::{
+    AnchorLabel, AnchorQualityGate, AnchorRecorder, MixtureOfSpecialists, SpecialistBank,
+};
 use wifi_densepose_core::types::CsiFrame;
 use wifi_densepose_signal::{BaselineCalibration, CalibrationRecorder};
 
@@ -190,6 +192,55 @@ struct SharedStatus {
 enum CalCommand {
     Start { params: StartParams, reply: oneshot::Sender<Result<SessionStatus, String>> },
     Stop { reply: oneshot::Sender<Result<ResultSummary, String>> },
+    EnrollAnchor {
+        room_id: String,
+        baseline_name: String,
+        label: AnchorLabel,
+        duration_s: u32,
+        reply: oneshot::Sender<Result<AnchorVerdict, String>>,
+    },
+}
+
+/// Accumulated in-server enrollment for one room (not persisted until train).
+#[derive(Default)]
+struct RoomEnroll {
+    baseline_id: String,
+    fs_hz: f32,
+    anchors: Vec<AnchorFeature>,
+}
+
+/// Result of capturing one anchor (`POST /enroll/anchor`).
+#[derive(Debug, Clone, Serialize)]
+pub struct AnchorVerdict {
+    /// Anchor label (snake_case).
+    pub label: String,
+    /// Passed the quality gate.
+    pub accepted: bool,
+    /// Rejection reason, if any.
+    pub reason: Option<String>,
+    /// Mean amplitude z-score vs baseline.
+    pub presence_z: f32,
+    /// Fraction of frames flagged as motion.
+    pub motion_rate: f32,
+    /// Frames captured.
+    pub frames: u32,
+    /// Accepted anchors so far for this room.
+    pub accepted_count: usize,
+    /// Next anchor in the sequence, if any.
+    pub next: Option<String>,
+}
+
+/// In-flight anchor capture owned by the ingest task.
+struct EnrollCapture {
+    recorder: AnchorRecorder,
+    baseline: BaselineCalibration,
+    label: AnchorLabel,
+    room_id: String,
+    baseline_id: String,
+    fs_hz: f32,
+    series: Vec<f32>,
+    deadline: Instant,
+    reply: Option<oneshot::Sender<Result<AnchorVerdict, String>>>,
 }
 
 #[derive(Clone)]
@@ -200,6 +251,8 @@ struct ApiState {
     window: Arc<RwLock<VecDeque<f32>>>,
     /// Default sample rate for periodicity extraction.
     fs_hz: f32,
+    /// In-server enrollment accumulator, keyed by `room_id`.
+    enroll: Arc<RwLock<HashMap<String, RoomEnroll>>>,
 }
 
 /// Bearer-token gate (applied only when `--token` is set). Constant-time-ish
@@ -252,6 +305,7 @@ pub async fn execute(args: CalibrateServeArgs) -> Result<()> {
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<CalCommand>(8);
     let window = Arc::new(RwLock::new(VecDeque::<f32>::with_capacity(LIVE_WINDOW)));
+    let enroll = Arc::new(RwLock::new(HashMap::<String, RoomEnroll>::new()));
 
     // Background ingest task owns the socket + recorder.
     {
@@ -259,12 +313,13 @@ pub async fn execute(args: CalibrateServeArgs) -> Result<()> {
         let default_tier = args.tier.clone();
         let output_dir = args.output_dir.clone();
         let window = window.clone();
+        let enroll = enroll.clone();
         tokio::spawn(async move {
-            ingest_loop(socket, cmd_rx, status, default_tier, output_dir, window).await;
+            ingest_loop(socket, cmd_rx, status, default_tier, output_dir, window, enroll).await;
         });
     }
 
-    let state = ApiState { cmd_tx, status, window, fs_hz: 15.0 };
+    let state = ApiState { cmd_tx, status, window, fs_hz: 15.0, enroll };
     let mut app = Router::new()
         .route("/", get(descriptor))
         .route("/api/v1/calibration/health", get(health))
@@ -275,6 +330,8 @@ pub async fn execute(args: CalibrateServeArgs) -> Result<()> {
         .route("/api/v1/calibration/baselines", get(baselines))
         .route("/api/v1/room/state", get(room_state))
         .route("/api/v1/room/train", post(train_room))
+        .route("/api/v1/enroll/anchor", post(enroll_anchor))
+        .route("/api/v1/enroll/status", get(enroll_status))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -324,9 +381,11 @@ async fn ingest_loop(
     default_tier: String,
     output_dir: String,
     window: Arc<RwLock<VecDeque<f32>>>,
+    enroll: Arc<RwLock<HashMap<String, RoomEnroll>>>,
 ) {
     let mut buf = vec![0u8; RECV_BUF];
     let mut active: Option<ActiveSession> = None;
+    let mut active_enroll: Option<EnrollCapture> = None;
     let mut tick = tokio::time::interval(Duration::from_millis(200));
     // Counters mirrored to shared status only on the 200 ms tick — avoids a lock
     // + SessionStatus clone on every UDP frame (CPU starvation under flood).
@@ -387,6 +446,35 @@ async fn ingest_loop(
                         None => { let _ = reply.send(Err("no active calibration session".into())); }
                     }
                 }
+                CalCommand::EnrollAnchor { room_id, baseline_name, label, duration_s, reply } => {
+                    if active.is_some() || active_enroll.is_some() {
+                        let _ = reply.send(Err("a capture is already running".into()));
+                        continue;
+                    }
+                    // Resolve the baseline as a sanitized name under output_dir.
+                    let bname = sanitize_room_id(&baseline_name);
+                    let bpath = format!("{output_dir}/{bname}.bin");
+                    let baseline = match tokio::fs::read(&bpath).await {
+                        Ok(bytes) => match BaselineCalibration::from_bytes(&bytes) {
+                            Ok(b) => b,
+                            Err(e) => { let _ = reply.send(Err(format!("invalid baseline {bname}: {e}"))); continue; }
+                        },
+                        Err(e) => { let _ = reply.send(Err(format!("baseline {bname} not found: {e}"))); continue; }
+                    };
+                    let baseline_id = baseline.calibration_uuid().to_string();
+                    eprintln!("[calibrate-serve] enroll anchor room={room_id} label={} ({}s)", label.as_str(), duration_s);
+                    active_enroll = Some(EnrollCapture {
+                        recorder: AnchorRecorder::new(label),
+                        baseline,
+                        label,
+                        room_id,
+                        baseline_id,
+                        fs_hz: 15.0,
+                        series: Vec::new(),
+                        deadline: Instant::now() + Duration::from_secs(duration_s.max(1) as u64),
+                        reply: Some(reply),
+                    });
+                }
             },
 
             // --- incoming CSI frame (no shared-status lock here; flushed on tick) ---
@@ -411,6 +499,10 @@ async fn ingest_loop(
                                 let _ = finalize(done, &output_dir, &status).await;
                             }
                         }
+                    }
+                    if let Some(ec) = active_enroll.as_mut() {
+                        ec.recorder.record_frame(&ec.baseline, &frame);
+                        ec.series.push(frame_scalar(&frame));
                     }
                 }
             },
@@ -448,6 +540,48 @@ async fn ingest_loop(
                             let snap = session_snapshot(&done, "aborted", Some(note.clone()));
                             status.write().await.session = Some(snap);
                             eprintln!("[calibrate-serve] {note}");
+                        }
+                    }
+                }
+                // Enroll-anchor capture finished?
+                let enroll_done = active_enroll.as_ref().map(|ec| Instant::now() >= ec.deadline).unwrap_or(false);
+                if enroll_done {
+                    if let Some(mut ec) = active_enroll.take() {
+                        let gate = AnchorQualityGate::default();
+                        let (anchor, reason) = ec.recorder.finalize(&gate, (unix_ms() / 1000) as i64);
+                        let mut verdict = AnchorVerdict {
+                            label: ec.label.as_str().into(),
+                            accepted: anchor.quality.accepted,
+                            reason,
+                            presence_z: anchor.quality.presence_z,
+                            motion_rate: anchor.quality.motion_rate,
+                            frames: anchor.quality.frames,
+                            accepted_count: 0,
+                            next: None,
+                        };
+                        if anchor.quality.accepted {
+                            let feat = AnchorFeature::from_series(&ec.room_id, ec.label, &ec.series, ec.fs_hz);
+                            let mut map = enroll.write().await;
+                            let re = map.entry(ec.room_id.clone()).or_insert_with(RoomEnroll::default);
+                            if re.baseline_id.is_empty() {
+                                re.baseline_id = ec.baseline_id.clone();
+                                re.fs_hz = ec.fs_hz;
+                            }
+                            if let Some(slot) = re.anchors.iter_mut().find(|a| a.label == ec.label) {
+                                *slot = feat;
+                            } else {
+                                re.anchors.push(feat);
+                            }
+                            verdict.accepted_count = re.anchors.len();
+                            verdict.next = AnchorLabel::SEQUENCE.iter().copied()
+                                .find(|l| !re.anchors.iter().any(|a| a.label == *l))
+                                .map(|l| l.as_str().to_string());
+                        } else {
+                            verdict.accepted_count = enroll.read().await.get(&ec.room_id).map(|re| re.anchors.len()).unwrap_or(0);
+                        }
+                        eprintln!("[calibrate-serve] enroll anchor {} accepted={} ({} total)", verdict.label, verdict.accepted, verdict.accepted_count);
+                        if let Some(tx) = ec.reply.take() {
+                            let _ = tx.send(Ok(verdict));
                         }
                     }
                 }
@@ -530,7 +664,9 @@ async fn descriptor() -> impl IntoResponse {
             "GET  /api/v1/calibration/result": "last finalized baseline summary",
             "GET  /api/v1/calibration/baselines": "list persisted baseline files",
             "GET  /api/v1/room/state?bank=<name>": "live mixture-of-specialists RoomState over the CSI window",
-            "POST /api/v1/room/train": "{ room_id, baseline_id, anchors[] } → train + persist a specialist bank"
+            "POST /api/v1/room/train": "{ room_id, baseline_id, anchors[]? } → train + persist a specialist bank (anchors[] optional if enrolled in-server)",
+            "POST /api/v1/enroll/anchor": "{ room_id, baseline, label, duration_s? } → capture one guided anchor (blocks for the capture)",
+            "GET  /api/v1/enroll/status?room=<id>": "enrollment progress (accepted anchors, next, complete)"
         }
     }))
 }
@@ -600,14 +736,22 @@ struct TrainRequest {
     anchors: Vec<AnchorFeature>,
 }
 
-/// Train a per-room specialist bank from posted anchors and persist it as
-/// `<output_dir>/<room_id>.json` (the name `room-state` reads back).
+/// Train a per-room specialist bank and persist it as `<output_dir>/<room_id>.json`
+/// (the name `room-state` reads back). Uses the posted `anchors` if present, else
+/// falls back to the in-server enrollment accumulated via `POST /enroll/anchor`.
 async fn train_room(State(st): State<ApiState>, Json(req): Json<TrainRequest>) -> impl IntoResponse {
-    if req.anchors.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"no anchors in request"}))).into_response();
-    }
+    let (anchors, baseline_id) = if !req.anchors.is_empty() {
+        (req.anchors.clone(), req.baseline_id.clone())
+    } else {
+        match st.enroll.read().await.get(&req.room_id) {
+            Some(re) if !re.anchors.is_empty() => (re.anchors.clone(), re.baseline_id.clone()),
+            _ => {
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"no anchors in request and none enrolled for this room"}))).into_response();
+            }
+        }
+    };
     let at = (unix_ms() / 1000) as i64;
-    let bank = match SpecialistBank::train(&req.room_id, &req.baseline_id, &req.anchors, at) {
+    let bank = match SpecialistBank::train(&req.room_id, &baseline_id, &anchors, at) {
         Ok(b) => b,
         Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("training failed: {e}")}))).into_response(),
     };
@@ -629,6 +773,76 @@ async fn train_room(State(st): State<ApiState>, Json(req): Json<TrainRequest>) -
         "specialists": kinds,
         "path": path,
     }))).into_response()
+}
+
+/// Body for `POST /api/v1/enroll/anchor`.
+#[derive(Deserialize)]
+struct EnrollAnchorBody {
+    room_id: String,
+    /// Baseline name (without `.bin`), resolved under `output_dir`.
+    baseline: String,
+    /// Anchor label (snake_case, e.g. `stand_still`).
+    label: String,
+    /// Capture duration (s); defaults to the anchor's recommended length.
+    duration_s: Option<u32>,
+}
+
+/// Capture one guided anchor against a baseline. Blocks for the capture
+/// duration, then returns the gate verdict (accept/reject + progress).
+async fn enroll_anchor(State(st): State<ApiState>, Json(b): Json<EnrollAnchorBody>) -> impl IntoResponse {
+    let label = match AnchorLabel::from_str(&b.label) {
+        Some(l) => l,
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("unknown anchor label {:?}", b.label)}))).into_response(),
+    };
+    let duration_s = b.duration_s.unwrap_or_else(|| label.duration_s());
+    let (tx, rx) = oneshot::channel();
+    let cmd = CalCommand::EnrollAnchor {
+        room_id: b.room_id,
+        baseline_name: b.baseline,
+        label,
+        duration_s,
+        reply: tx,
+    };
+    if st.cmd_tx.send(cmd).await.is_err() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"ingest task unavailable"}))).into_response();
+    }
+    match rx.await {
+        Ok(Ok(v)) => (StatusCode::OK, Json(serde_json::to_value(v).unwrap())).into_response(),
+        Ok(Err(e)) => (StatusCode::CONFLICT, Json(serde_json::json!({"error": e}))).into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"no reply"}))).into_response(),
+    }
+}
+
+/// Query for `GET /api/v1/enroll/status`.
+#[derive(Deserialize)]
+struct EnrollStatusQuery {
+    room: String,
+}
+
+/// Enrollment progress for a room.
+async fn enroll_status(State(st): State<ApiState>, Query(q): Query<EnrollStatusQuery>) -> impl IntoResponse {
+    let map = st.enroll.read().await;
+    let (accepted, baseline_id): (Vec<String>, String) = match map.get(&q.room) {
+        Some(re) => (
+            re.anchors.iter().map(|a| a.label.as_str().to_string()).collect(),
+            re.baseline_id.clone(),
+        ),
+        None => (Vec::new(), String::new()),
+    };
+    let next = AnchorLabel::SEQUENCE
+        .iter()
+        .copied()
+        .find(|l| !accepted.iter().any(|a| a == l.as_str()))
+        .map(|l| l.as_str().to_string());
+    Json(serde_json::json!({
+        "room": q.room,
+        "baseline_id": baseline_id,
+        "accepted": accepted,
+        "count": accepted.len(),
+        "total": AnchorLabel::SEQUENCE.len(),
+        "next": next,
+        "complete": next.is_none() && !accepted.is_empty(),
+    }))
 }
 
 /// Query for `GET /api/v1/room/state`.

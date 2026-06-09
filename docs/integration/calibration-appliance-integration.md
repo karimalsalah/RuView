@@ -136,12 +136,12 @@ Anchor labels (fixed sequence, **JSON wire = snake_case**, test-enforced): `empt
 | GET | `/api/v1/calibration/result` | last finalized baseline summary |
 | GET | `/api/v1/calibration/baselines` | list persisted `.bin` baselines |
 | GET | `/api/v1/room/state?bank=<name>` | **live RoomState** (mixture-of-specialists over the CSI window; bank resolved as a sanitized name under `output_dir`) |
-| POST | `/api/v1/room/train` | `{ room_id, baseline_id, anchors[] }` → train + persist a specialist bank as `<output_dir>/<room_id>.json` (read back via `/room/state?bank=<room_id>`) |
+| POST | `/api/v1/room/train` | `{ room_id, baseline_id, anchors[]? }` → train + persist a specialist bank as `<output_dir>/<room_id>.json` (anchors[] optional if enrolled via `/enroll/anchor`; read back via `/room/state?bank=<room_id>`) |
+| POST | `/api/v1/enroll/anchor` | `{ room_id, baseline, label, duration_s? }` → capture one guided anchor against a baseline (blocks for the capture); returns the gate verdict + progress |
+| GET | `/api/v1/enroll/status?room=<id>` | enrollment progress (accepted anchors, next, complete) |
 
 A single background task owns the UDP socket + recorder (handlers talk to it over an mpsc channel +
-shared status snapshot), so the API is non-blocking. Enrollment/train/room-state are CLI today
-(`enroll`/`train-room`/`room-watch`); exposing them over the same API is a small, additive follow-on —
-**recommended appliance enhancement** (see §6).
+shared status snapshot), so the API is non-blocking. **The full pipeline is now drivable over HTTP** — baseline (`start`/`stop`) → `enroll/anchor` (×8) → `room/train` → `room/state` — so the appliance UI needs no CLI. (The CLI `enroll`/`train-room`/`room-watch` remain for scripted/headless use.)
 
 ---
 
