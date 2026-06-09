@@ -285,6 +285,25 @@ async fn require_bearer(
 // Public entry point
 // ---------------------------------------------------------------------------
 
+/// Build the API router (without the optional auth layer). Shared by `execute`
+/// and the integration tests.
+fn build_router(state: ApiState) -> Router {
+    Router::new()
+        .route("/", get(descriptor))
+        .route("/api/v1/calibration/health", get(health))
+        .route("/api/v1/calibration/start", post(start))
+        .route("/api/v1/calibration/status", get(status_handler))
+        .route("/api/v1/calibration/stop", post(stop))
+        .route("/api/v1/calibration/result", get(result))
+        .route("/api/v1/calibration/baselines", get(baselines))
+        .route("/api/v1/room/state", get(room_state))
+        .route("/api/v1/room/train", post(train_room))
+        .route("/api/v1/enroll/anchor", post(enroll_anchor))
+        .route("/api/v1/enroll/status", get(enroll_status))
+        .layer(CorsLayer::permissive())
+        .with_state(state)
+}
+
 /// Run the calibration HTTP API server (blocks until Ctrl-C).
 pub async fn execute(args: CalibrateServeArgs) -> Result<()> {
     std::fs::create_dir_all(&args.output_dir)
@@ -320,20 +339,7 @@ pub async fn execute(args: CalibrateServeArgs) -> Result<()> {
     }
 
     let state = ApiState { cmd_tx, status, window, fs_hz: 15.0, enroll };
-    let mut app = Router::new()
-        .route("/", get(descriptor))
-        .route("/api/v1/calibration/health", get(health))
-        .route("/api/v1/calibration/start", post(start))
-        .route("/api/v1/calibration/status", get(status_handler))
-        .route("/api/v1/calibration/stop", post(stop))
-        .route("/api/v1/calibration/result", get(result))
-        .route("/api/v1/calibration/baselines", get(baselines))
-        .route("/api/v1/room/state", get(room_state))
-        .route("/api/v1/room/train", post(train_room))
-        .route("/api/v1/enroll/anchor", post(enroll_anchor))
-        .route("/api/v1/enroll/status", get(enroll_status))
-        .layer(CorsLayer::permissive())
-        .with_state(state);
+    let mut app = build_router(state);
 
     // Optional bearer auth — required before any non-loopback exposure.
     if let Some(token) = args.token.clone() {
@@ -1003,5 +1009,93 @@ mod tests {
         assert_eq!(sanitize_room_id(""), "default");
         assert_eq!(sanitize_room_id("..\\..\\win"), "win");
         assert!(!sanitize_room_id("a/b/c").contains('/'));
+    }
+
+    // ---- HTTP integration tests (router via tower oneshot, no network/ingest) ----
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt; // for `oneshot`
+
+    fn test_state(dir: &str) -> ApiState {
+        let (cmd_tx, _rx) = mpsc::channel::<CalCommand>(8);
+        let status = Arc::new(RwLock::new(SharedStatus {
+            output_dir: dir.to_string(),
+            ..Default::default()
+        }));
+        let window = Arc::new(RwLock::new(VecDeque::<f32>::new()));
+        let enroll = Arc::new(RwLock::new(HashMap::<String, RoomEnroll>::new()));
+        // Tested handlers never use cmd_tx; drop the receiver.
+        drop(_rx);
+        ApiState { cmd_tx, status, window, fs_hz: 15.0, enroll }
+    }
+
+    async fn req(app: Router, method: &str, uri: &str, body: Option<&str>) -> StatusCode {
+        let b = body.map(|s| Body::from(s.to_string())).unwrap_or_else(Body::empty);
+        let r = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(b)
+            .unwrap();
+        app.oneshot(r).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn health_and_descriptor_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = build_router(test_state(dir.path().to_str().unwrap()));
+        assert_eq!(req(app.clone(), "GET", "/", None).await, StatusCode::OK);
+        assert_eq!(req(app, "GET", "/api/v1/calibration/health", None).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn train_then_state_and_traversal_defense() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path().to_str().unwrap());
+        // Fill the live window with a 0.3 Hz breathing sine.
+        {
+            let mut w = state.window.write().await;
+            for i in 0..200 {
+                w.push_back((2.0 * std::f32::consts::PI * 0.3 * i as f32 / 15.0).sin());
+            }
+        }
+        let app = build_router(state);
+
+        // POST /room/train with two anchors → bank persisted as t.json.
+        let body = r#"{"room_id":"t","baseline_id":"b","anchors":[
+            {"room_id":"t","label":"empty","features":{"mean":1.0,"variance":1.0,"motion":0.1,"breathing_score":0.0,"breathing_hz":0.0,"heart_score":0.0,"heart_hz":0.0}},
+            {"room_id":"t","label":"stand_still","features":{"mean":1.0,"variance":10.0,"motion":0.2,"breathing_score":0.0,"breathing_hz":0.0,"heart_score":0.0,"heart_hz":0.0}}
+        ]}"#;
+        assert_eq!(req(app.clone(), "POST", "/api/v1/room/train", Some(body)).await, StatusCode::OK);
+        assert!(dir.path().join("t.json").exists(), "bank file written");
+
+        // GET /room/state?bank=t → 200 (trained bank loaded, window present).
+        assert_eq!(req(app.clone(), "GET", "/api/v1/room/state?bank=t", None).await, StatusCode::OK);
+
+        // Path-traversal: ?bank=../../etc/passwd is sanitized → NOT_FOUND, never reads outside dir.
+        assert_eq!(
+            req(app.clone(), "GET", "/api/v1/room/state?bank=../../etc/passwd", None).await,
+            StatusCode::NOT_FOUND
+        );
+
+        // Train with no anchors and nothing enrolled → 400.
+        assert_eq!(
+            req(app, "POST", "/api/v1/room/train", Some(r#"{"room_id":"none","baseline_id":"b","anchors":[]}"#)).await,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn enroll_status_empty_and_bad_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = build_router(test_state(dir.path().to_str().unwrap()));
+        // No enrollment yet → 200 with next=empty.
+        assert_eq!(req(app.clone(), "GET", "/api/v1/enroll/status?room=x", None).await, StatusCode::OK);
+        // Unknown anchor label → 400.
+        assert_eq!(
+            req(app, "POST", "/api/v1/enroll/anchor", Some(r#"{"room_id":"x","baseline":"b","label":"nope"}"#)).await,
+            StatusCode::BAD_REQUEST
+        );
     }
 }
