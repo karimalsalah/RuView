@@ -20,12 +20,13 @@
 //! `&mut` recorder lock-free and the API non-blocking. CORS is permissive so a
 //! browser UI served from any origin can call it during development.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -36,9 +37,26 @@ use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tower_http::cors::CorsLayer;
+use wifi_densepose_calibration::extract::Features;
+use wifi_densepose_calibration::{MixtureOfSpecialists, SpecialistBank};
+use wifi_densepose_core::types::CsiFrame;
 use wifi_densepose_signal::{BaselineCalibration, CalibrationRecorder};
 
 use crate::calibrate::{parse_csi_packet, tier_config};
+
+/// Rolling window of per-frame scalars (mean amplitude) for live `room-state`
+/// inference. Maintained by the ingest task regardless of any baseline session.
+const LIVE_WINDOW: usize = 256;
+
+/// One scalar per frame: mean amplitude across subcarriers/streams.
+fn frame_scalar(frame: &CsiFrame) -> f32 {
+    let a = &frame.amplitude;
+    if a.is_empty() {
+        0.0
+    } else {
+        (a.sum() / a.len() as f64) as f32
+    }
+}
 
 const RECV_BUF: usize = 2048;
 
@@ -178,6 +196,10 @@ enum CalCommand {
 struct ApiState {
     cmd_tx: mpsc::Sender<CalCommand>,
     status: Arc<RwLock<SharedStatus>>,
+    /// Rolling per-frame scalars for live `room-state` inference.
+    window: Arc<RwLock<VecDeque<f32>>>,
+    /// Default sample rate for periodicity extraction.
+    fs_hz: f32,
 }
 
 /// Bearer-token gate (applied only when `--token` is set). Constant-time-ish
@@ -229,18 +251,20 @@ pub async fn execute(args: CalibrateServeArgs) -> Result<()> {
     }));
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<CalCommand>(8);
+    let window = Arc::new(RwLock::new(VecDeque::<f32>::with_capacity(LIVE_WINDOW)));
 
     // Background ingest task owns the socket + recorder.
     {
         let status = status.clone();
         let default_tier = args.tier.clone();
         let output_dir = args.output_dir.clone();
+        let window = window.clone();
         tokio::spawn(async move {
-            ingest_loop(socket, cmd_rx, status, default_tier, output_dir).await;
+            ingest_loop(socket, cmd_rx, status, default_tier, output_dir, window).await;
         });
     }
 
-    let state = ApiState { cmd_tx, status };
+    let state = ApiState { cmd_tx, status, window, fs_hz: 15.0 };
     let mut app = Router::new()
         .route("/", get(descriptor))
         .route("/api/v1/calibration/health", get(health))
@@ -249,6 +273,7 @@ pub async fn execute(args: CalibrateServeArgs) -> Result<()> {
         .route("/api/v1/calibration/stop", post(stop))
         .route("/api/v1/calibration/result", get(result))
         .route("/api/v1/calibration/baselines", get(baselines))
+        .route("/api/v1/room/state", get(room_state))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -297,6 +322,7 @@ async fn ingest_loop(
     status: Arc<RwLock<SharedStatus>>,
     default_tier: String,
     output_dir: String,
+    window: Arc<RwLock<VecDeque<f32>>>,
 ) {
     let mut buf = vec![0u8; RECV_BUF];
     let mut active: Option<ActiveSession> = None;
@@ -305,6 +331,8 @@ async fn ingest_loop(
     // + SessionStatus clone on every UDP frame (CPU starvation under flood).
     let mut frames_seen: u64 = 0;
     let mut last_frame_ms: u64 = 0;
+    // Live rolling window, flushed to the shared `window` on the tick.
+    let mut win_local: VecDeque<f32> = VecDeque::with_capacity(LIVE_WINDOW);
 
     loop {
         tokio::select! {
@@ -364,9 +392,14 @@ async fn ingest_loop(
             Ok(n) = socket.recv(&mut buf) => {
                 frames_seen += 1;
                 last_frame_ms = unix_ms();
-                if let Some(sess) = active.as_mut() {
-                    let tier = sess.tier.clone();
-                    if let Some(frame) = parse_csi_packet(&buf[..n], &tier) {
+                let parse_tier = active.as_ref().map(|s| s.tier.clone()).unwrap_or_else(|| default_tier.clone());
+                if let Some(frame) = parse_csi_packet(&buf[..n], &parse_tier) {
+                    // Always maintain the live window (drives /room/state).
+                    win_local.push_back(frame_scalar(&frame));
+                    while win_local.len() > LIVE_WINDOW {
+                        win_local.pop_front();
+                    }
+                    if let Some(sess) = active.as_mut() {
                         if let Ok(score) = sess.recorder.record(&frame) {
                             sess.z_median = score.amplitude_z_median;
                             sess.z_max = score.amplitude_z_max;
@@ -381,7 +414,7 @@ async fn ingest_loop(
                 }
             },
 
-            // --- 200 ms tick: flush counters + session snapshot, deadline check ---
+            // --- 200 ms tick: flush counters + window + session snapshot, deadline check ---
             _ = tick.tick() => {
                 {
                     let mut s = status.write().await;
@@ -390,6 +423,11 @@ async fn ingest_loop(
                     if let Some(sess) = active.as_ref() {
                         s.session = Some(session_snapshot(sess, "recording", None));
                     }
+                }
+                {
+                    let mut w = window.write().await;
+                    w.clear();
+                    w.extend(win_local.iter().copied());
                 }
                 if let Some(sess) = active.as_ref() {
                     if Instant::now() >= sess.deadline {
@@ -489,7 +527,8 @@ async fn descriptor() -> impl IntoResponse {
             "GET  /api/v1/calibration/status": "live session progress (poll for UI)",
             "POST /api/v1/calibration/stop": "finalize current session early",
             "GET  /api/v1/calibration/result": "last finalized baseline summary",
-            "GET  /api/v1/calibration/baselines": "list persisted baseline files"
+            "GET  /api/v1/calibration/baselines": "list persisted baseline files",
+            "GET  /api/v1/room/state?bank=<name>": "live mixture-of-specialists RoomState over the CSI window"
         }
     }))
 }
@@ -547,6 +586,44 @@ async fn result(State(st): State<ApiState>) -> impl IntoResponse {
         Some(r) => (StatusCode::OK, Json(serde_json::to_value(r).unwrap())).into_response(),
         None => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error":"no finalized baseline yet"}))).into_response(),
     }
+}
+
+/// Query for `GET /api/v1/room/state`.
+#[derive(Deserialize)]
+struct RoomStateQuery {
+    /// Bank name (sanitized; resolved as `<output_dir>/<bank>.json`).
+    bank: String,
+    /// Sample rate override (Hz).
+    fs: Option<f32>,
+}
+
+/// Live mixture-of-specialists readout over the current CSI window.
+async fn room_state(State(st): State<ApiState>, Query(q): Query<RoomStateQuery>) -> impl IntoResponse {
+    // Resolve the bank as a sanitized name under output_dir — no arbitrary file read.
+    let name = sanitize_room_id(&q.bank);
+    let dir = { st.status.read().await.output_dir.clone() };
+    let path = format!("{dir}/{name}.json");
+    let raw = match tokio::fs::read_to_string(&path).await {
+        Ok(r) => r,
+        Err(e) => {
+            return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": format!("bank '{name}' not found: {e}")}))).into_response();
+        }
+    };
+    let bank = match SpecialistBank::from_json(&raw) {
+        Ok(b) => b,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("invalid bank: {e}")}))).into_response(),
+    };
+
+    let series: Vec<f32> = { st.window.read().await.iter().copied().collect() };
+    if series.len() < 32 {
+        return (StatusCode::OK, Json(serde_json::json!({"state":"warming_up","frames":series.len()}))).into_response();
+    }
+    let fs = q.fs.unwrap_or(st.fs_hz);
+    let features = Features::from_series(&series, fs);
+    let baseline_id = bank.baseline_id.clone();
+    let mix = MixtureOfSpecialists::new(bank);
+    let room = mix.infer(&features, &baseline_id);
+    (StatusCode::OK, Json(serde_json::to_value(room).unwrap())).into_response()
 }
 
 async fn baselines(State(st): State<ApiState>) -> impl IntoResponse {

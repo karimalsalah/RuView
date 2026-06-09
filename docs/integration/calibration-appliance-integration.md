@@ -135,6 +135,7 @@ Anchor labels (fixed sequence): `empty, stand_still, sit, lie_down, breathe_slow
 | POST | `/api/v1/calibration/stop` | finalize early → result summary |
 | GET | `/api/v1/calibration/result` | last finalized baseline summary |
 | GET | `/api/v1/calibration/baselines` | list persisted `.bin` baselines |
+| GET | `/api/v1/room/state?bank=<name>` | **live RoomState** (mixture-of-specialists over the CSI window; bank resolved as a sanitized name under `output_dir`) |
 
 A single background task owns the UDP socket + recorder (handlers talk to it over an mpsc channel +
 shared status snapshot), so the API is non-blocking. Enrollment/train/room-state are CLI today
@@ -225,7 +226,7 @@ exchange bank/model deltas, never raw CSI. Hardening already in place:
 
 So capture + API + auth are proven on real CSI (both boxes); a **clean-baseline `enroll → train-room → room-watch`** loop is **not yet proven on-target** — that's the headline gap to close on the appliance.
 
-- **Known follow-ups (appliance backlog):** `--source-format adr018v6` to drive calibration from the Pi's own nexmon (no ESP32/transcoder); a clean empty-room enroll→train→infer on-target; phase-based (vs mean-amplitude) breathing carrier; RVF/HNSW persistence (currently JSON); enroll/train HTTP endpoints; ADR-150 Hailo backbone; true 2-node multistatic; ADR-105 federation.
+- **Known follow-ups (appliance backlog):** `--source-format adr018v6` to drive calibration from the Pi's own nexmon (no ESP32/transcoder); a clean empty-room enroll→train→infer on-target; phase-based (vs mean-amplitude) breathing carrier; RVF/HNSW persistence (currently JSON); enroll/train HTTP endpoints (live `/room/state` already added); ADR-150 Hailo backbone; true 2-node multistatic; ADR-105 federation.
 
 **Reference:** ADR-151 (`docs/adr/ADR-151-room-calibration-specialist-training.md`), ADR-135 (baseline),
 ADR-029 (multistatic), ADR-150 (RF Foundation Encoder), ADR-105 (federation), ADR-147 (OccWorld/Hailo).
