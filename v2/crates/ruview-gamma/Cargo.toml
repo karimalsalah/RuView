@@ -1,0 +1,49 @@
+[package]
+name = "ruview-gamma"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Adaptive Gamma Entrainment (ADR-250) — governed, deterministic, safety-constrained personalization of 40 Hz-prior sensory stimulation (RuView sensing + RuVector response modeling + RuFlo audit). Research platform, not a medical device."
+repository.workspace = true
+keywords = ["gamma", "entrainment", "neuromodulation", "bayesian-optimization", "research"]
+categories = ["science", "simulation"]
+readme = "README.md"
+# Research platform. Publishing intentionally disabled: this crate touches a
+# safety-critical, clinical-adjacent domain (ADR-250 §12). Flip to true only
+# after safety + claim-discipline sign-off.
+publish = false
+
+[lib]
+# rlib for native workspace linking; cdylib so the deterministic core can be
+# wrapped for a browser/edge dashboard later (same posture as nvsim).
+crate-type = ["cdylib", "rlib"]
+
+# `ruview-gamma` is a standalone leaf crate with NO internal RuView deps — the
+# governed software core (optimizer, safety envelope, RuVector update logic,
+# session witness) must be testable and replayable bit-exactly before any
+# hardware actuation or human exposure. Hardware/RF/EEG adapters land behind
+# feature flags after the core ships (ADR-250 §21, Milestones 2–4).
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+# Deterministic ChaCha20 PRNG: same (person, state, stimulus, seed) yields
+# byte-identical synthetic responses across runs and machines — the
+# reproducibility commitment in ADR-250 §11. default-features off drops the
+# getrandom OS-entropy path; all seeds are caller-supplied u64.
+rand = { version = "0.8", default-features = false }
+rand_chacha = { version = "0.3", default-features = false }
+
+# SHA-256 session witness: hash(protocol, model, device, stimulus, sensors,
+# response, safety) — the RuFlo reproducibility trail (ADR-250 §11).
+sha2 = { workspace = true }
+
+[dev-dependencies]
+approx = "0.5"
+criterion = { workspace = true }
+
+[[bench]]
+name = "optimizer_bench"
+harness = false
