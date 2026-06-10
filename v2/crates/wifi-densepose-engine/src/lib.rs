@@ -116,6 +116,10 @@ pub struct StreamingEngine {
     slam: RfSlam,
     // ADR-139 live loop: stable track_id -> PersonTrack WorldId.
     person_tracks: BTreeMap<u64, WorldId>,
+    // WorldGraph belief retention: max live SemanticState nodes. The live loop
+    // appends one belief per cycle (1.7M/day at 20 Hz); durable history is the
+    // recorder's job, so old beliefs are evicted deterministically past this cap.
+    semantic_retention: usize,
 }
 
 impl StreamingEngine {
@@ -135,7 +139,18 @@ impl StreamingEngine {
             evolution: None,
             slam: RfSlam::with_discovery(0.5, 5, 0.6),
             person_tracks: BTreeMap::new(),
+            semantic_retention: Self::DEFAULT_SEMANTIC_RETENTION,
         }
+    }
+
+    /// Default cap on live `SemanticState` beliefs in the WorldGraph
+    /// (~6 minutes of full-rate history at 20 Hz; older beliefs are evicted —
+    /// durable history belongs to the recorder).
+    pub const DEFAULT_SEMANTIC_RETENTION: usize = 7_200;
+
+    /// Override the `SemanticState` retention cap (minimum 1).
+    pub fn set_semantic_retention(&mut self, max_states: usize) {
+        self.semantic_retention = max_states.max(1);
     }
 
     /// ADR-139 live loop: create or update a `PersonTrack` node by stable
@@ -350,6 +365,10 @@ impl StreamingEngine {
             provenance.clone(),
             &[room],
         );
+        // Retention: bound the live belief set (one node is appended per cycle;
+        // without this the graph grows ~1.7M nodes/day at 20 Hz). Deterministic
+        // eviction; the just-added belief is always newest and survives.
+        self.world.prune_semantic_states(self.semantic_retention);
 
         // 7. Deterministic witness over the trust decision (ADR-137 §2.7).
         let witness = witness_of(&provenance, effective_class);
@@ -545,6 +564,32 @@ mod tests {
         assert_eq!(o1.provenance.evidence, o2.provenance.evidence);
         assert_eq!(o1.effective_class, o2.effective_class);
         assert_eq!(o1.quality.per_node_weights, o2.quality.per_node_weights);
+    }
+
+    /// WorldGraph belief retention: the live loop appends one SemanticState per
+    /// cycle; past the cap the oldest beliefs are evicted so graph memory is
+    /// bounded, while structural nodes and the newest belief always survive.
+    #[test]
+    fn semantic_state_growth_is_bounded() {
+        let (mut e, room) = engine();
+        e.set_semantic_retention(5);
+        let cal = CalibrationId(1);
+        let mut last_id = None;
+        let baseline_nodes = 2; // room + sensor
+        for i in 0..20u64 {
+            let frames = [
+                node_frame(0, 1000 + i * 50_000, 56),
+                node_frame(1, 1001 + i * 50_000, 56),
+            ];
+            let out = e.process_cycle(&frames, cal, room, 5_000 + i as i64).unwrap();
+            last_id = Some(out.semantic_id);
+            assert!(e.world().node_count() <= baseline_nodes + 5);
+        }
+        // 20 cycles ran, only 5 beliefs remain, newest is still present.
+        assert_eq!(e.world().node_count(), baseline_nodes + 5);
+        assert!(e.world().node(last_id.unwrap()).is_some());
+        // Structural nodes survive eviction.
+        assert!(e.world().node(room).is_some());
     }
 
     fn node_frame_scaled(node_id: u8, ts_us: u64, n_sub: usize, scale: f32) -> MultiBandCsiFrame {
