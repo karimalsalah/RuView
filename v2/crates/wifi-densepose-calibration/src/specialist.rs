@@ -57,33 +57,61 @@ pub trait Specialist {
 // Presence
 // ---------------------------------------------------------------------------
 
-/// Binary presence gate: variance threshold learned from empty vs occupied anchors.
+/// Binary presence gate learned from empty vs occupied anchors.
+///
+/// Two complementary signals (ADR-152 finding, "variance-only presence"):
+/// - **variance** — motion/occupancy energy; catches a moving person but is
+///   blind to a *motionless* one, whose body raises the scalar *mean* (extra
+///   multipath energy) while barely raising variance;
+/// - **mean shift** — |mean − empty-room mean|; catches the motionless person
+///   the variance channel misses. Symmetric (abs) because a body can shadow
+///   paths and *lower* the mean too.
+///
+/// Present when EITHER channel fires.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PresenceSpecialist {
     /// Decision threshold on series variance.
     pub threshold: f32,
     /// Occupied-anchor mean variance (for confidence scaling).
     pub occupied_var: f32,
+    /// Empty-room mean of the scalar series (mean-shift reference).
+    #[serde(default)]
+    pub empty_mean: f32,
+    /// |mean − empty_mean| beyond which the mean alone indicates presence.
+    /// `None` disables the channel — both for banks persisted before the
+    /// channel existed (serde default) and for rooms where the empty/occupied
+    /// means don't separate at train time.
+    #[serde(default)]
+    pub mean_dist_threshold: Option<f32>,
 }
 
 impl PresenceSpecialist {
-    /// Fit from anchors: midpoint between the empty variance and the mean
-    /// occupied variance.
+    /// Fit from anchors: variance threshold at the midpoint between the empty
+    /// variance and the mean occupied variance; mean-shift threshold at half
+    /// the empty→occupied mean distance (inert when the means don't separate).
     pub fn train(anchors: &[AnchorFeature]) -> Option<Self> {
         let empty = anchors.iter().find(|a| a.label == AnchorLabel::Empty)?;
-        let occ: Vec<f32> = anchors
+        let occ: Vec<&Features> = anchors
             .iter()
             .filter(|a| a.label.expects_presence())
-            .map(|a| a.features.variance)
+            .map(|a| &a.features)
             .collect();
         if occ.is_empty() {
             return None;
         }
-        let occ_mean = occ.iter().sum::<f32>() / occ.len() as f32;
+        let occ_var = occ.iter().map(|f| f.variance).sum::<f32>() / occ.len() as f32;
+        let occ_mean = occ.iter().map(|f| f.mean).sum::<f32>() / occ.len() as f32;
         let empty_var = empty.features.variance;
+        let empty_mean = empty.features.mean;
+
+        let mean_dist = (occ_mean - empty_mean).abs();
+        let mean_dist_threshold = (mean_dist > 1e-4).then(|| 0.5 * mean_dist);
+
         Some(Self {
-            threshold: 0.5 * (empty_var + occ_mean),
-            occupied_var: occ_mean.max(empty_var + 1e-3),
+            threshold: 0.5 * (empty_var + occ_var),
+            occupied_var: occ_var.max(empty_var + 1e-3),
+            empty_mean,
+            mean_dist_threshold,
         })
     }
 }
@@ -93,9 +121,22 @@ impl Specialist for PresenceSpecialist {
         SpecialistKind::Presence
     }
     fn infer(&self, f: &Features) -> Option<SpecialistReading> {
-        let present = f.variance > self.threshold;
-        let span = (self.occupied_var - self.threshold).max(1e-3);
-        let confidence = ((f.variance - self.threshold).abs() / span).clamp(0.0, 1.0);
+        let by_variance = f.variance > self.threshold;
+        let mean_dist = (f.mean - self.empty_mean).abs();
+        let by_mean = self
+            .mean_dist_threshold
+            .is_some_and(|thr| mean_dist > thr);
+        let present = by_variance || by_mean;
+
+        // Confidence: strongest margin among the channels that are enabled.
+        let var_span = (self.occupied_var - self.threshold).max(1e-3);
+        let var_conf = ((f.variance - self.threshold).abs() / var_span).clamp(0.0, 1.0);
+        let mean_conf = self
+            .mean_dist_threshold
+            .map(|thr| ((mean_dist - thr).abs() / thr.max(1e-3)).clamp(0.0, 1.0))
+            .unwrap_or(0.0);
+        let confidence = var_conf.max(mean_conf);
+
         Some(SpecialistReading {
             kind: SpecialistKind::Presence,
             value: if present { 1.0 } else { 0.0 },
@@ -371,6 +412,27 @@ mod tests {
         }
     }
 
+    /// Like `feat` but with an explicit series mean (the presence mean-gate input).
+    fn feat_mean(mean: f32, variance: f32, motion: f32) -> Features {
+        Features {
+            mean,
+            variance,
+            motion,
+            breathing_score: 0.0,
+            breathing_hz: 0.0,
+            heart_score: 0.0,
+            heart_hz: 0.0,
+        }
+    }
+
+    fn af_mean(label: AnchorLabel, mean: f32, variance: f32, motion: f32) -> AnchorFeature {
+        AnchorFeature {
+            room_id: "r".into(),
+            label,
+            features: feat_mean(mean, variance, motion),
+        }
+    }
+
     #[test]
     fn presence_learns_threshold_and_classifies() {
         let anchors = vec![
@@ -380,6 +442,39 @@ mod tests {
         let p = PresenceSpecialist::train(&anchors).unwrap();
         assert!(p.infer(&feat(12.0, 0.2, 0.0, 0.0)).unwrap().value == 1.0);
         assert!(p.infer(&feat(1.0, 0.1, 0.0, 0.0)).unwrap().value == 0.0);
+    }
+
+    /// ADR-152 "variance-only presence" regression: a MOTIONLESS person raises
+    /// the scalar mean (extra multipath energy) but barely the variance — the
+    /// mean channel must still detect them, and a window matching the empty
+    /// room on BOTH channels must still read absent.
+    #[test]
+    fn presence_detects_motionless_person_via_mean_shift() {
+        let anchors = vec![
+            af_mean(AnchorLabel::Empty, 1.0, 1.0, 0.1),
+            af_mean(AnchorLabel::StandStill, 1.6, 10.0, 0.2),
+            af_mean(AnchorLabel::LieDown, 1.5, 8.0, 0.15),
+        ];
+        let p = PresenceSpecialist::train(&anchors).unwrap();
+        // Motionless person: variance at the empty level, mean shifted.
+        let r = p.infer(&feat_mean(1.55, 1.0, 0.05)).unwrap();
+        assert_eq!(r.value, 1.0, "motionless person must read present");
+        // Truly empty window: both channels quiet.
+        let r = p.infer(&feat_mean(1.0, 1.0, 0.05)).unwrap();
+        assert_eq!(r.value, 0.0, "empty room must still read absent");
+    }
+
+    /// Banks persisted BEFORE the mean gate existed must deserialize to the
+    /// inert (+∞) gate and keep their original variance-only behavior.
+    #[test]
+    fn presence_old_bank_json_stays_variance_only() {
+        let old_json = r#"{"threshold":5.5,"occupied_var":10.0}"#;
+        let p: PresenceSpecialist = serde_json::from_str(old_json).unwrap();
+        assert!(p.mean_dist_threshold.is_none());
+        // Mean wildly shifted but variance below threshold → still absent
+        // (old behavior preserved; the mean channel is disabled).
+        let r = p.infer(&feat_mean(99.0, 1.0, 0.05)).unwrap();
+        assert_eq!(r.value, 0.0);
     }
 
     #[test]

@@ -8,9 +8,10 @@
 //! - **empty room**: stable per-subcarrier amplitudes + small complex Gaussian
 //!   noise (the ADR-135 roundtrip-test fingerprint) — never motion-flagged;
 //! - **person present**: a common amplitude offset (extra multipath energy),
-//!   small body sway, and a constant phase shift. The offset is sized inside the
-//!   z band (1.5, 2.0) the deviation heuristic leaves between "present"
-//!   (`presence_z ≥ 1.5`) and "moving" (`amplitude_z_median > 2.0`);
+//!   small body sway, and a constant phase shift. Presence strength is free to
+//!   exceed z = 2.0 — since the ADR-152 z-band-squeeze fix, anchor motion is
+//!   measured from frame-to-frame deltas, not from the absolute deviation, so
+//!   a strongly-reflecting *still* person is no longer misread as "moving";
 //! - **breathing**: a few-percent periodic amplitude modulation (0.125–0.3 Hz)
 //!   on a subset of subcarriers — visible in the mean-amplitude scalar the CLI
 //!   uses, invisible to the per-frame *median* z (so still anchors stay still);
@@ -76,8 +77,9 @@ const WINDOW_FRAMES: usize = 600;
 #[derive(Clone, Copy, Default)]
 struct Person {
     /// Common amplitude offset in units of NOISE_STD (presence strength).
-    /// Must stay inside (1.5, 2.0): below it the gate sees no one, above it
-    /// every frame is motion-flagged.
+    /// Anything ≥ 1.5 reads as present; values above 2.0 are explicitly
+    /// exercised to guard the ADR-152 z-band-squeeze fix (presence strength
+    /// must not read as motion).
     presence_z: f32,
     /// Per-frame common amplitude jitter (body sway / fidgeting), in NOISE_STD.
     sway_z: f32,
@@ -161,8 +163,11 @@ fn frame_scalar(frame: &CsiFrame) -> f32 {
 fn anchor_person(label: AnchorLabel) -> Option<Person> {
     let p = match label {
         AnchorLabel::Empty => return None,
+        // Strong reflector at z = 3.0 — every frame exceeds the baseline's
+        // absolute motion threshold (z > 2.0). Pre-ADR-152 this anchor was
+        // unenrollable ("too much motion"); the delta-based gate must accept it.
         AnchorLabel::StandStill => Person {
-            presence_z: 1.8, sway_z: 0.25, phase_shift: 0.10, ..Default::default()
+            presence_z: 3.0, sway_z: 0.25, phase_shift: 0.10, ..Default::default()
         },
         AnchorLabel::Sit => Person {
             presence_z: 1.65, sway_z: 0.25, phase_shift: 0.08, ..Default::default()
@@ -395,6 +400,26 @@ fn full_loop_baseline_enroll_extract_train_infer() {
         breathing.value
     );
     assert!(state.restlessness.is_some(), "restlessness specialist trained");
+
+    // Motionless-person case (ADR-152 "variance-only presence" regression):
+    // a strong reflector standing perfectly still — variance stays at the
+    // empty-room level, only the scalar MEAN shifts. The mean channel of the
+    // presence specialist must still detect them.
+    let motionless = Person {
+        presence_z: 3.0,
+        sway_z: 0.05,
+        phase_shift: 0.10,
+        ..Default::default()
+    };
+    let f_still = live_window(&mut sim, Some(&motionless));
+    let state = mix.infer(&f_still, &baseline_id);
+    let presence = state.presence.expect("presence specialist trained");
+    assert_eq!(
+        presence.value, 1.0,
+        "motionless person must be detected via the mean-shift channel \
+         (variance {:.2e} vs empty-level)",
+        f_still.variance
+    );
 
     // Negative case: a fresh empty-room window must NOT report presence,
     // breathing, heartbeat, or posture.

@@ -33,10 +33,32 @@ pub struct Features {
     pub heart_hz: f32,
 }
 
+/// Minimum periodicity score for a band's frequency to enter the prototype
+/// embedding. Below it `autocorr_dominant` still reports its best in-band
+/// peak, but for noise windows that peak is a *random* in-band frequency —
+/// letting it into the embedding makes posture/anomaly prototype distances
+/// noisy (ADR-152 finding, "ungated hz embedding"). The raw `breathing_hz` /
+/// `heart_hz` fields stay un-gated: the breathing/heartbeat specialists apply
+/// their own (stricter) `min_score` gates.
+pub const EMBED_MIN_SCORE: f32 = 0.25;
+
 impl Features {
     /// A fixed-length numeric embedding for nearest-prototype classifiers.
+    ///
+    /// The hz components are zeroed unless their periodicity score clears
+    /// [`EMBED_MIN_SCORE`] — see the constant's docs.
     pub fn embedding(&self) -> [f32; 5] {
-        [self.mean, self.variance, self.motion, self.breathing_hz, self.heart_hz]
+        let breathing_hz = if self.breathing_score >= EMBED_MIN_SCORE {
+            self.breathing_hz
+        } else {
+            0.0
+        };
+        let heart_hz = if self.heart_score >= EMBED_MIN_SCORE {
+            self.heart_hz
+        } else {
+            0.0
+        };
+        [self.mean, self.variance, self.motion, breathing_hz, heart_hz]
     }
 
     /// Squared Euclidean distance between two embeddings.
@@ -117,6 +139,14 @@ impl AnchorFeature {
 
 /// Dominant frequency in `[lo_hz, hi_hz]` via autocorrelation, with a normalized
 /// peak score in `[0, 1]`. Returns `(0, 0)` if no confident peak.
+///
+/// The winning lag must be an **interior local maximum** of the in-band
+/// autocorrelation, not a band-edge value (ADR-152 finding, "heart-band
+/// leakage"): a strong out-of-band rhythm — breathing bleeding into the HR
+/// band — produces a monotonic slope whose largest in-band value sits at the
+/// lag floor (pinning `heart_hz` near the band's top frequency with a high
+/// score). A genuine in-band periodicity peaks *inside* the band; an edge
+/// maximum is leakage and is rejected.
 pub fn autocorr_dominant(sig: &[f32], fs: f32, lo_hz: f32, hi_hz: f32) -> (f32, f32) {
     let n = sig.len();
     if n < 16 || fs <= 0.0 || hi_hz <= lo_hz {
@@ -133,15 +163,25 @@ pub fn autocorr_dominant(sig: &[f32], fs: f32, lo_hz: f32, hi_hz: f32) -> (f32, 
         return (0.0, 0.0);
     }
 
+    // Autocorrelation over the band, extended one lag on each side so the
+    // band edges have real neighbors for the local-max test.
+    let ext_min = lag_min.saturating_sub(1).max(1);
+    let ext_max = (lag_max + 1).min(n - 1);
+    let acc: Vec<f32> = (ext_min..=ext_max)
+        .map(|lag| (0..(n - lag)).map(|i| sig[i] * sig[i + lag]).sum())
+        .collect();
+
     let mut best = 0.0f32;
     let mut best_lag = 0usize;
     for lag in lag_min..=lag_max {
-        let mut acc = 0.0f32;
-        for i in 0..(n - lag) {
-            acc += sig[i] * sig[i + lag];
+        let idx = lag - ext_min;
+        if idx == 0 || idx + 1 >= acc.len() {
+            continue; // no neighbor on one side — cannot prove a local max
         }
-        if acc > best {
-            best = acc;
+        let v = acc[idx];
+        // Interior local maximum (ties to the left tolerated for plateaus).
+        if v >= acc[idx - 1] && v > acc[idx + 1] && v > best {
+            best = v;
             best_lag = lag;
         }
     }
@@ -203,5 +243,53 @@ mod tests {
         let f = Features::from_series(&[], 15.0);
         assert_eq!(f.mean, 0.0);
         assert_eq!(f.breathing_hz, 0.0);
+    }
+
+    /// ADR-152 "heart-band leakage" regression: a strong breathing rhythm must
+    /// NOT register as a heart-band periodicity — its in-band autocorr maximum
+    /// sits at the band edge (monotonic leak), not an interior peak.
+    #[test]
+    fn heart_band_rejects_breathing_leakage() {
+        let fs = 20.0;
+        // Pure 0.30 Hz breathing, no heart component at all.
+        let s = sine(0.30, fs, (fs * 30.0) as usize);
+        let (hz, score) = autocorr_dominant(&s, fs, 0.8, 3.0);
+        assert!(
+            score < 0.25,
+            "breathing-only signal scored {score} in the heart band (hz {hz}) — \
+             the lag-floor leak is back"
+        );
+        // The breathing band itself must still find the true rate.
+        let (bhz, bscore) = autocorr_dominant(&s, fs, 0.1, 0.6);
+        assert!((bhz - 0.30).abs() < 0.05, "breathing band got {bhz}");
+        assert!(bscore > 0.5);
+    }
+
+    /// ADR-152 "ungated hz embedding" regression: a low-score in-band peak
+    /// (noise) must NOT leak its random frequency into the prototype
+    /// embedding, while a confident peak must pass through unchanged.
+    #[test]
+    fn embedding_gates_hz_on_score() {
+        let noisy = Features {
+            mean: 1.0,
+            variance: 2.0,
+            motion: 0.3,
+            breathing_score: EMBED_MIN_SCORE - 0.05,
+            breathing_hz: 0.42, // random in-band peak from a noise window
+            heart_score: EMBED_MIN_SCORE - 0.05,
+            heart_hz: 3.3, // breathing leakage pinned at the lag floor
+        };
+        let e = noisy.embedding();
+        assert_eq!(e[3], 0.0, "low-score breathing_hz must be gated out");
+        assert_eq!(e[4], 0.0, "low-score heart_hz must be gated out");
+
+        let confident = Features {
+            breathing_score: EMBED_MIN_SCORE + 0.3,
+            heart_score: EMBED_MIN_SCORE + 0.3,
+            ..noisy
+        };
+        let e = confident.embedding();
+        assert_eq!(e[3], 0.42, "confident breathing_hz must pass through");
+        assert_eq!(e[4], 3.3, "confident heart_hz must pass through");
     }
 }
