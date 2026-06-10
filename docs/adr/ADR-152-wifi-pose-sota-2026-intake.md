@@ -64,7 +64,7 @@ Pull the Apache-2.0 weights + 360k-sample dataset; run three measurements: (a) t
 
 ### 2.4 Hardware watch items — ACCEPTED (no code now)
 
-- **802.11bf**: track silicon/certification; revisit when any commodity chipset exposes standardized sensing measurements. Our opportunistic CSI extraction remains the mechanism until then.
+- **802.11bf**: track silicon/certification; OTA binding remains deferred until commodity chipsets expose standardized sensing measurements. **Amended by ADR-153** (2026-06-10): implement a pure Rust forward-compatibility protocol layer now — typed procedure models, a deterministic session FSM, a transport abstraction, simulation tests, and an `OpportunisticCsiBridge` that maps today's ESP32 CSI batches into standardized sensing-report shape.
 - **esp_wifi_sensing**: benchmark our presence pipeline against the vendor FSM (one afternoon; useful external baseline). Do **not** treat as drop-in (refuted claim).
 - **ZTECSITool AP**: optional high-resolution anchor node for the ADR-029 multistatic mesh — procurement-gated; only pursue if a 160 MHz anchor materially helps tomography.
 
@@ -72,6 +72,29 @@ Pull the Apache-2.0 weights + 360k-sample dataset; run three measurements: (a) t
 
 - No pivot toward "wireless foundation model" papers that don't ship WiFi-CSI artifacts (HeterCSI, FMCW pilot, surveys).
 - No DensePose-UV work item: the field has not demonstrated UV regression from commodity WiFi; keypoints remain our supervised target (F5).
+
+### 2.6 RuVector vendor sync + integration opportunities (added 2026-06-10)
+
+**Vendor sync record.** `vendor/ruvector` moved from pin `e38347601` (2026-05-07) to `a083bd77f` (origin/main, 3 commits past tag `ruvector-v0.2.28`; vendored workspace version 2.2.3). 111 commits in the range, roughly half NAPI-binary/lint chores. Substantive: graph condensation + differentiable min-cut (#547), core HNSW correctness fixes v2.2.3 (#502), RUSTSEC/clippy hardening (#504), ONNX embedder API-contract fix (#523/#525 — npm/TypeScript package only), dead parallel-worker import removal (#532). *Evidence: MEASURED (git range + commit-stat inspection).*
+
+**Opportunity table.** Workspace policy is crates.io versions only, so unpublished crates are WATCH by definition regardless of fit.
+
+| Crate | What it offers | wifi-densepose target | crates.io | Verdict |
+|---|---|---|---|---|
+| `ruvector-graph-condense` (new, #547) | Training-free min-cut graph condensation + **differentiable normalized-cut loss** (`DiffCutCondenser`, analytic MinCutPool-style gradients, gradient-checked tests; provenance-retaining super-nodes) | `subcarrier_selection.rs` (condense 114 subcarriers into cut-preserving regions instead of raw min-cut); auxiliary clustering regularizer for `wifi-densepose-train`; `DynamicPersonMatcher` region structure | **Not published** | **WATCH** — strongest technical fit in the sync; adopt when published. README's "no published method uses graph-cut condensation" is CLAIMED; the diffcut implementation + tests are MEASURED |
+| `ruvector-attention` 2.1.0 | #304 SOTA modules: MLA, KV-cache, SSM, sparse/MoE, hybrid search, Graph RAG (publish date 2026-03-27 matches the #304 commit — MEASURED) | Supersedes pinned 2.0.4 used by `model.rs` spatial attention + `bvp.rs`; SSM/MLA are candidate pure-Rust edge-inference primitives for the ADR-150 encoder | 2.1.0 (pinned **2.0.4**) | **ADOPT** (minor bump; API-compat check first) |
+| `ruvector-gnn` 2.2.0 | panic→`Result` constructors, gradient clipping, MSE/CE/BCE losses, seeded-RNG layer init (#495 is post-2.2.0) | `wifi-densepose-train` GNN path (pinned 2.0.5, `default-features = false`) | 2.2.0 (pinned **2.0.5**) | **ADOPT** (bump) |
+| `ruvector-mincut` / `ruvector-solver` 2.0.6 | Patch-level fixes (workspace republish 2026-03-25) | `metrics.rs` DynamicPersonMatcher, subcarrier interpolation, triangulation | 2.0.6 (pinned **2.0.4** each) | **ADOPT** (routine patch bump) |
+| `ruvector-core` 2.2.3 (vendor) | HNSW correctness: k=0 guard, sorted results, flat-index fixes, cross-integration helpers (#502 — MEASURED, `index/hnsw.rs` + new integration tests) | `homecore-recorder` `RuvectorSemanticIndex` (real HNSW consumer); `sketch.rs` quantization unaffected | **2.2.0 = latest published**; 2.2.3 unpublished | **WATCH** — bump the moment 2.2.3 publishes |
+| `ruvector-cnn` 2.0.6 | Pure-Rust SIMD conv kernels (AVX2/NEON/WASM), MobileNetV3, INT8 quantization, contrastive losses (InfoNCE/triplet, #252) | **Not** the WiFlow-STD training port — `wiflow_std/model.rs` is tch/libtorch (MEASURED). Relevant to the *edge inference* path of the trained ~2.2 MB int8 model, and InfoNCE/triplet overlaps AETHER (ADR-024) | 2.0.6 | **EVALUATE** — only if/when we commit to a no-libtorch edge runtime for WiFlow-STD-class models |
+| `ruvector-acorn` (new-ish) | ACORN predicate-agnostic filtered HNSW (SIGMOD'24 algorithm; γ·M denser graphs for low-selectivity filters) | Metadata-filtered pattern search over ADR-151 calibration banks — speculative; bank sizes are far below where filtered-ANN recall collapse matters | **Not published** | **WATCH** |
+| `ruvector-cluster` 2.0.6 | Distributed sharding, gossip discovery, DAG consensus | No current need; ADR-029 mesh coordination is ESP32-side, not vector-DB-side | 2.0.6 | **WATCH** |
+| ONNX embedder fix (#523/#525) | API-contract + packaging fixes in `npm/packages/ruvector` (TypeScript) | None — `wifi-densepose-nn`'s ONNX backend is Rust (ort/tract), untouched by this change (MEASURED: commit touches npm/ only) | n/a | No action |
+| `ruvector-perception` (new, #547) | "Physical perception substrate" (hypothesis/topology/witness modules) — agent-perception oriented, not RF | None identified | Not published | WATCH (name-overlap only) |
+
+**Security note (RUSTSEC #504).** The substantive fixes target `ruvllm`, `ruvector-dag`, `prime-radiant`, `rvagent-*`, and the `ruvector-server` HTTP endpoint (NaN-safe `partial_cmp`, input-validation guards, env-allowlisted exec) — **none of which we pin**. The commit states `cargo audit` returns clean across the workspace. *Evidence: MEASURED (commit message + file list). Conclusion: no pinned version has an outstanding advisory; no urgent bump required.* The NaN-sort hardening is panic-robustness hygiene our pinned 2.0.4-era crates predate, which is one more reason for the routine bumps below.
+
+**Version-bump recommendations (follow-up PR — no Cargo.toml change in this ADR):** `ruvector-mincut` 2.0.4→2.0.6, `ruvector-solver` 2.0.4→2.0.6, `ruvector-attention` 2.0.4→2.1.0, `ruvector-gnn` 2.0.5→2.2.0. Current: `ruvector-core` 2.2.0, `ruvector-attn-mincut` 2.0.4, `ruvector-temporal-tensor` 2.0.6, `ruvector-crv` 0.1.1 — all at latest published. Nothing in the sync changes §2.1.2 geometry conditioning (our `viewpoint/attention.rs` `GeometricBias` already implements the fusion mechanism) or the ADR-150 MAE recipe (training stays in tch).
 
 ## 3. Consequences
 

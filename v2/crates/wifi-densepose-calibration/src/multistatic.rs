@@ -46,7 +46,12 @@ impl MultiNodeMixture {
 
     /// Register a node's bank. `current_baseline_id` is the baseline the node is
     /// observing now (drift vs the bank's training baseline → STALE).
-    pub fn add_node(&mut self, node_id: u8, bank: SpecialistBank, current_baseline_id: impl Into<String>) {
+    pub fn add_node(
+        &mut self,
+        node_id: u8,
+        bank: SpecialistBank,
+        current_baseline_id: impl Into<String>,
+    ) {
         self.nodes.insert(
             node_id,
             NodeEntry {
@@ -130,15 +135,13 @@ impl MultiNodeMixture {
 
 /// Presence: a person is present if ANY node sees one; confidence = max.
 fn fuse_presence(states: &[RoomState]) -> Option<SpecialistReading> {
-    let readings: Vec<&SpecialistReading> = states.iter().filter_map(|s| s.presence.as_ref()).collect();
+    let readings: Vec<&SpecialistReading> =
+        states.iter().filter_map(|s| s.presence.as_ref()).collect();
     if readings.is_empty() {
         return None;
     }
     let any_present = readings.iter().any(|r| r.value > 0.5);
-    let confidence = readings
-        .iter()
-        .map(|r| r.confidence)
-        .fold(0.0f32, f32::max);
+    let confidence = readings.iter().map(|r| r.confidence).fold(0.0f32, f32::max);
     Some(SpecialistReading {
         kind: readings[0].kind,
         value: if any_present { 1.0 } else { 0.0 },

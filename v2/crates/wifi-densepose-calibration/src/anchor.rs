@@ -98,9 +98,7 @@ impl AnchorLabel {
     /// Suggested capture duration (seconds).
     pub fn duration_s(&self) -> u32 {
         match self {
-            AnchorLabel::BreatheSlow
-            | AnchorLabel::BreatheNormal
-            | AnchorLabel::SleepPosture => 30,
+            AnchorLabel::BreatheSlow | AnchorLabel::BreatheNormal | AnchorLabel::SleepPosture => 30,
             _ => 20,
         }
     }
@@ -269,10 +267,7 @@ impl EnrollmentSession {
 
     /// `(accepted, total)` progress.
     pub fn progress(&self) -> (usize, usize) {
-        (
-            self.accepted_anchors().len(),
-            AnchorLabel::SEQUENCE.len(),
-        )
+        (self.accepted_anchors().len(), AnchorLabel::SEQUENCE.len())
     }
 
     /// Whether every anchor in the sequence has been accepted.

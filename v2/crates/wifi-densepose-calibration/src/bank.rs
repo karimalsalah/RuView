@@ -90,6 +90,15 @@ impl SpecialistBank {
         self
     }
 
+    /// The fixed-length geometry embedding of the bank's snapshot (ADR-152
+    /// §2.1.2) — the conditioning vector the ADR-151 P6 LoRA heads concatenate
+    /// with the backbone embedding. Derived on demand from [`Self::geometry`]
+    /// (it is a pure function of the snapshot), so it adds no schema surface;
+    /// a geometry-free bank yields the well-defined all-zero embedding.
+    pub fn geometry_embedding(&self) -> crate::geometry_embedding::GeometryEmbedding {
+        crate::geometry_embedding::GeometryEmbedding::from_nodes(&self.geometry)
+    }
+
     /// `true` if the bank was trained against a different baseline (it is STALE).
     pub fn is_stale(&self, current_baseline_id: &str) -> bool {
         self.baseline_id != current_baseline_id
@@ -206,6 +215,31 @@ mod tests {
         let json = bank.to_json().unwrap();
         let back = SpecialistBank::from_json(&json).unwrap();
         assert_eq!(back.geometry, geometry);
+    }
+
+    /// ADR-152 §2.1.2: the embedding is derived from the snapshot — present
+    /// geometry conditions it, absent geometry yields the all-zero vector.
+    #[test]
+    fn geometry_embedding_derives_from_snapshot() {
+        let bare = SpecialistBank::train("r", "base-1", &full_anchors(), 1000).unwrap();
+        assert_eq!(
+            bare.geometry_embedding(),
+            crate::geometry_embedding::GeometryEmbedding::default(),
+            "no geometry → all-zero embedding"
+        );
+
+        let geometry = vec![
+            NodeGeometry::new(1, "tape-measure").with_position(0.0, 0.0, 1.0),
+            NodeGeometry::new(2, "tape-measure").with_position(3.0, 0.0, 1.0),
+        ];
+        let bank = bare.with_geometry(geometry.clone());
+        let emb = bank.geometry_embedding();
+        assert_eq!(
+            emb,
+            crate::geometry_embedding::GeometryEmbedding::from_nodes(&geometry),
+            "embedding is a pure function of the snapshot"
+        );
+        assert!(emb.as_slice().iter().any(|&x| x != 0.0));
     }
 
     /// ADR-152 schema-compat fixture: bank JSON persisted BEFORE the geometry
