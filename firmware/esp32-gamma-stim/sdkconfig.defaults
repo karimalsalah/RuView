@@ -1,0 +1,9 @@
+# esp32-gamma-stim defaults (S3/C6 class; single-purpose actuator node)
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_PARTITION_TABLE_SINGLE_APP=y
+CONFIG_FREERTOS_HZ=1000
+# Console on USB-CDC where available; falls back to UART0.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+# Keep radio off: this node is a deterministic actuator, not a network device.
+# (No WiFi/BT init in the firmware; nothing to configure out.)
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y

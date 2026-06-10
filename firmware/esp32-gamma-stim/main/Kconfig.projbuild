@@ -1,0 +1,40 @@
+menu "Gamma Stimulation (ADR-250)"
+
+config GAMMA_STIM_LED_GPIO
+    int "LED PWM output GPIO"
+    default 4
+    help
+        GPIO driving the LED MOSFET/driver. The 36-44 Hz stimulus is the
+        envelope on a 19.5 kHz PWM carrier.
+
+config GAMMA_STIM_AUDIO_GPIO
+    int "Audio tone output GPIO"
+    default 5
+    help
+        GPIO driving the speaker/buzzer amplifier input (square tone,
+        envelope-gated). Use an analog volume stage for real loudness control.
+
+config GAMMA_STIM_SYNC_GPIO
+    int "Sync-out GPIO (HIL measurement)"
+    default 6
+    help
+        Mirrors the stimulation envelope for photodiode/logic-analyzer
+        verification of the +/-0.1 Hz and <5 ms A/V sync HIL targets.
+
+config GAMMA_STIM_ESTOP_GPIO
+    int "Emergency-stop button GPIO (active low)"
+    default 7
+    help
+        Button to GND. Falling edge latches an emergency stop: outputs off in
+        the ISR, sessions refused until UNLOCK. Stop latency target <100 ms;
+        the ISR path achieves microseconds.
+
+config GAMMA_STIM_AUDIO_TONE_HZ
+    int "Audio tone carrier frequency (Hz)"
+    range 200 2000
+    default 440
+    help
+        The audible tone gated at the stimulation frequency. GENUS-style
+        protocols use a click/tone burst per cycle.
+
+endmenu
