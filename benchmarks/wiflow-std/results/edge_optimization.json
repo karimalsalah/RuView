@@ -626,5 +626,147 @@
       "description": "seed-42 file-level 70/15/15 test split, corrupted windows excluded, seed-42 random subset (same as quantize_bench/eval_ort_accuracy)",
       "subset_size": 10000
     }
+  },
+  "tiny_variant": {
+    "env": {
+      "torch": "2.12.0+cpu",
+      "onnxruntime": "1.26.0",
+      "platform": "Windows-11-10.0.26200-SP0",
+      "num_threads": 16,
+      "checkpoint": "results\\tiny_best.pth",
+      "checkpoint_size_bytes": 340555,
+      "params": 56290,
+      "variant_config": {
+        "tcn": [
+          68,
+          56,
+          44,
+          32
+        ],
+        "conv": [
+          2,
+          4,
+          8,
+          16
+        ],
+        "attn_groups": 2,
+        "groups_mode": "depthwise",
+        "input_pw_groups": 4
+      }
+    },
+    "export": {
+      "mode": "dynamic-batch",
+      "exporter": "torchscript",
+      "opset": 17,
+      "file": "tiny_fp32_dynamic.onnx",
+      "size_bytes": 295279,
+      "size_mb": 0.295279,
+      "verified_batches": [
+        1,
+        2,
+        64
+      ],
+      "note": "AdaptiveAvgPool2d((15,1)) replaced at export by an exact mean(-1) + constant averaging matmul (final_width 16 is not a multiple of 15, which the TorchScript exporter rejects); exactness proven by the parity check vs the original torch model"
+    },
+    "parity": {
+      "fixture": "results/parity_fixture.npz input (batch 2, seed 42); reference output recomputed with the tiny torch model",
+      "max_abs_diff_vs_torch": 1.4901161193847656e-07,
+      "pass_lt_1e-4": true
+    },
+    "int8_static_percentile_conv": {
+      "file": "tiny_int8_static_percentile_conv.onnx",
+      "size_bytes": 248278,
+      "size_mb": 0.248278,
+      "calibration": {
+        "method": "percentile",
+        "percentile": 99.99,
+        "windows": 512,
+        "scope": "conv-only TRAIN-split corruption-free",
+        "seconds": 1.5347836017608643
+      },
+      "per_channel": true,
+      "activation_type": "QInt8",
+      "weight_type": "QInt8",
+      "max_abs_diff_vs_fp32_fixture": 0.018491357564926147
+    },
+    "latency": {
+      "note": "3 interleaved repetitions per variant, median ms/window; full-model sessions are same-session references",
+      "tiny_onnx_fp32": {
+        "batch1_reps": [
+          0.6312500008789357,
+          0.6834500018157996,
+          0.6595999984710943
+        ],
+        "batch64_reps": [
+          0.37747578119251557,
+          0.24196640623586063,
+          0.2314671875183194
+        ],
+        "batch1_ms_per_window_median": 0.6595999984710943,
+        "batch64_ms_per_window_median": 0.24196640623586063
+      },
+      "tiny_onnx_int8_static_percentile_conv": {
+        "batch1_reps": [
+          0.7988500001374632,
+          0.9382499993080273,
+          0.8451000030618161
+        ],
+        "batch64_reps": [
+          0.9211476562995813,
+          1.3045390625165965,
+          1.026230468767153
+        ],
+        "batch1_ms_per_window_median": 0.8451000030618161,
+        "batch64_ms_per_window_median": 1.026230468767153
+      },
+      "full_onnx_fp32_reference": {
+        "batch1_reps": [
+          2.267249998112675,
+          2.80170000041835,
+          2.132149998942623
+        ],
+        "batch64_reps": [
+          1.3050578124875756,
+          1.4244992187855132,
+          1.8014164062947202
+        ],
+        "batch1_ms_per_window_median": 2.267249998112675,
+        "batch64_ms_per_window_median": 1.4244992187855132
+      },
+      "full_onnx_int8_static_percentile_conv_reference": {
+        "batch1_reps": [
+          5.529599999135826,
+          4.768399998283712,
+          6.215800000063609
+        ],
+        "batch64_reps": [
+          3.815724218725336,
+          3.1025562500417436,
+          4.333318749957016
+        ],
+        "batch1_ms_per_window_median": 5.529599999135826,
+        "batch64_ms_per_window_median": 3.815724218725336
+      }
+    },
+    "accuracy_subset": {
+      "description": "seed-42 file-level 70/15/15 test split, corrupted windows excluded, seed-42 random subset (same as quantize_bench/eval_ort_accuracy/static_ptq_bench)",
+      "subset_size": 10000
+    },
+    "accuracy": {
+      "tiny_onnx_fp32": {
+        "samples": 10000,
+        "pck@20": 0.941106667804718,
+        "pck@50": 0.99369333152771,
+        "mpjpe": 0.012527281279861927,
+        "wall_seconds": 10.927234888076782
+      },
+      "tiny_onnx_int8_static_percentile_conv": {
+        "samples": 10000,
+        "pck@20": 0.9268133331298828,
+        "pck@50": 0.9932933319091797,
+        "mpjpe": 0.014906252065300942,
+        "wall_seconds": 12.320892333984375
+      }
+    }
   }
 }

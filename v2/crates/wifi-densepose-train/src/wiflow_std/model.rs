@@ -59,33 +59,40 @@ impl WiFlowStdModel {
         let vs = nn::VarStore::new(device);
         let root = vs.root();
 
-        // TCN stack: dilation doubles per level, causal padding.
+        // TCN stack: dilation doubles per level, causal padding. Per-conv
+        // groups follow `config.tcn_groups_mode`; only block 0's pointwise/
+        // downsample convs use `config.input_pw_groups` (ADR-152 sweep).
         let mut tcn = Vec::with_capacity(config.tcn_channels.len());
-        let mut c_in = config.subcarriers as i64;
+        let mut c_in = config.subcarriers;
         for (i, &c_out) in config.tcn_channels.iter().enumerate() {
             let dilation = 1_i64 << i;
+            let pw_groups = if i == 0 { config.input_pw_groups } else { 1 };
             tcn.push(GroupedTemporalBlock::new(
                 &root / format!("tcn{i}"),
-                c_in,
+                c_in as i64,
                 c_out as i64,
                 dilation,
-                config.tcn_groups as i64,
+                config.tcn_conv_groups(c_in) as i64,
+                config.tcn_conv_groups(c_out) as i64,
+                pw_groups as i64,
                 config.dropout,
             ));
-            c_in = c_out as i64;
+            c_in = c_out;
         }
 
-        // 2-D conv encoder: ConvBlock1 (stride 1) + strided asymmetric blocks.
+        // 2-D conv encoder: ConvBlock1 (stride 1) + asymmetric blocks with
+        // the derived stride schedule ([2, 2, 2, 2] at the upstream default).
         let c0 = config.conv_channels[0] as i64;
         let conv_in = ConvBlock::new(&root / "conv_in", 1, c0, 1);
         let mut conv_blocks = Vec::with_capacity(config.conv_channels.len());
+        let strides = config.conv_strides();
         let mut c_in = c0;
         for (i, &c_out) in config.conv_channels.iter().enumerate() {
             conv_blocks.push(ConvBlock::new(
                 &root / format!("conv{i}"),
                 c_in,
                 c_out as i64,
-                2,
+                strides[i] as i64,
             ));
             c_in = c_out as i64;
         }
@@ -93,8 +100,8 @@ impl WiFlowStdModel {
         let attention =
             DualAxialAttention::new(&root / "attention", c_in, config.attention_groups as i64);
 
-        // Decoder: c → c/2 (3×3) → 2 (1×1), BN + SiLU after each conv.
-        let mid = c_in / 2;
+        // Decoder: c → decoder_mid (3×3) → 2 (1×1), BN + SiLU after each conv.
+        let mid = config.decoder_mid() as i64;
         let dec_conv1 = nn::conv2d(
             &root / "dec_conv1",
             c_in,
@@ -239,6 +246,26 @@ mod tests {
         // Pins the tch graph against the verified reference (2,225,042).
         assert_eq!(model.num_parameters(), cfg.param_count() as i64);
         assert_eq!(model.num_parameters(), 2_225_042);
+    }
+
+    /// ADR-152 efficiency-sweep compact presets: the tch graph must realise
+    /// exactly the trained checkpoints' measured parameter counts
+    /// (benchmarks/wiflow-std/results/efficiency_sweep.jsonl) and produce
+    /// the standard [B, 15, 2] output.
+    #[test]
+    fn compact_preset_param_counts_and_shapes() {
+        for (cfg, expected) in [
+            (WiFlowStdConfig::half(), 843_834_i64),
+            (WiFlowStdConfig::quarter(), 338_600),
+            (WiFlowStdConfig::tiny(), 56_290),
+        ] {
+            tch::manual_seed(0);
+            let model = WiFlowStdModel::new(&cfg, Device::Cpu).expect("preset builds");
+            assert_eq!(model.num_parameters(), expected);
+            assert_eq!(model.num_parameters(), cfg.param_count() as i64);
+            let out = model.forward_inference(&random_csi(&cfg, 2));
+            assert_eq!(out.size(), &[2, 15, 2]);
+        }
     }
 
     #[test]

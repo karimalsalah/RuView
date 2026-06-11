@@ -63,7 +63,7 @@ mod layers;
 #[cfg(feature = "tch-backend")]
 pub mod model;
 
-pub use config::WiFlowStdConfig;
+pub use config::{TcnGroupsMode, WiFlowStdConfig};
 
 #[cfg(feature = "tch-backend")]
 pub use model::WiFlowStdModel;

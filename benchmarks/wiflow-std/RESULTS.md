@@ -267,6 +267,64 @@ Findings:
   says capacity *hurts* cross-subject, so the compact end may generalize no
   worse, but that is a hypothesis, not a measurement.
 
+### Compact-variant edge artifacts (MEASURED, 2026-06-11)
+
+Edge pipeline for the **tiny** checkpoint (56,290 params), same machinery and
+protocol as the full-model edge rows above (this Windows box, torch
+2.12.0+cpu, onnxruntime 1.26.0; dynamic-batch opset-17 TorchScript export;
+static QDQ **Percentile(99.99) conv-only** int8 calibrated on **512**
+corruption-free TRAIN-split windows; accuracy on the identical 10k-window
+seed-42 clean test subset; latency = median ms/window over 3 interleaved
+reps, with the full-model fp32/int8 sessions interleaved as same-session
+references). Script: `tiny_edge_bench.py`; raw:
+`results/edge_optimization.json` (`tiny_variant`). Torch-vs-ORT parity on the
+stored fixture input: **max abs diff 1.5e-7 — PASS** (< 1e-4). The tiny fp32
+subset PCK@20 (94.11%) matches the full clean-test sweep figure (94.11%)
+exactly, so the subset remains representative.
+
+Two forced deviations, both recorded in the JSON:
+
+1. **Adaptive-pool export rewrite.** tiny's derived stride schedule
+   `[2,1,1,1]` leaves feature width 16, and the TorchScript exporter rejects
+   `AdaptiveAvgPool2d((15,1))` when 15 is not a factor of the input height
+   (the full model never hit this — its width was exactly 15). Since the
+   pool over a fixed-size map is a fixed linear operator, the export wrapper
+   replaces it with `mean(-1)` (W axis, a factor) + a constant averaging
+   matmul using PyTorch's exact bin rule; the parity check (vs the original
+   torch model with the real pool) proves exactness.
+2. **Calibration count 512, not "~500"**: ORT 1.26's histogram collector
+   `np.asarray()`'s the per-batch maxima, so the calibration count must be a
+   multiple of the 64-window calibration batch or the ragged last batch
+   crashes it (the earlier static-PTQ run dodged this by using exactly 512).
+
+| Variant | Disk size | Batch 1 (ms/win) | Batch 64 (ms/win) | PCK@20 | PCK@50 | MPJPE |
+|---|---|---|---|---|---|---|
+| full ONNX fp32 (same-session ref) | 8.97 MB | 2.27 | 1.42 | 96.68% | 99.15% | 0.00936 |
+| full static QDQ Percentile conv-only (same-session ref) | 2.53 MB | 5.53 | 3.82 | 96.61% | 99.16% | 0.01031 |
+| **tiny ONNX fp32** | **0.295 MB** | **0.66** | **0.24** | **94.11%** | 99.37% | 0.01253 |
+| tiny static QDQ Percentile conv-only | 0.248 MB | 0.85 | 1.03 | 92.68% | 99.33% | 0.01491 |
+
+(tiny torch `.pth` checkpoint for reference: 0.34 MB on disk; 56,290 fp32
+params ≈ 225 KB of weights.)
+
+Findings:
+
+- **The smallest deployable WiFlow-class model is the tiny ONNX fp32
+  artifact: ~295 KB on disk, 0.66 ms/window batch-1 CPU (~1,500 windows/s),
+  94.1% PCK@20** — 30× smaller and ~3.4× faster (in-session) than the full
+  ONNX fp32 model for −2.6 pt PCK@20.
+- **int8 is a bad trade at this scale.** Static QDQ conv-only — the recipe
+  that cost the full model only 0.07 pt — costs tiny **−1.43 pt** PCK@20
+  (94.11 → 92.68%) and +19% MPJPE, saves only 47 KB (−16%; QDQ scales and
+  the fp32 BN/attention glue are proportionally larger in a small graph),
+  and is *slower* than tiny fp32 (0.85 vs 0.66 ms b1; 1.03 vs 0.24 ms b64 —
+  QDQ kernel overhead dominates when the convs are this small). A 56k-param
+  model has little redundancy left to absorb weight+activation rounding.
+- Deployment guidance, compact edition: ship tiny as **ONNX fp32** — at
+  295 KB the int8 size saving solves no real constraint and costs accuracy
+  and speed. If ~250 KB vs ~295 KB ever matters, weight-only quantization
+  would be the thing to try next, not QDQ.
+
 ## Measurement (b): BLOCKED-ON-DATA (attempted 2026-06-10)
 
 The fine-tune-on-ESP32 measurement stopped at dataset characterization, per the

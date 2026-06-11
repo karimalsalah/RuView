@@ -41,12 +41,20 @@ pub(super) struct GroupedTemporalBlock {
 }
 
 impl GroupedTemporalBlock {
+    /// `g_in`/`g_out`: group counts of the two grouped convs (each conv
+    /// groups over its own channel count — they differ under the ADR-152
+    /// compact variants' `Gcd`/`Depthwise` modes). `pw_groups` groups the
+    /// first pointwise conv and the residual projection (`input_pw_groups`
+    /// on block 0; 1 everywhere else).
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         vs: nn::Path,
         c_in: i64,
         c_out: i64,
         dilation: i64,
-        groups: i64,
+        g_in: i64,
+        g_out: i64,
+        pw_groups: i64,
         dropout: f64,
     ) -> Self {
         let k = TCN_KERNEL as i64;
@@ -58,24 +66,25 @@ impl GroupedTemporalBlock {
             bias: false,
             ..Default::default()
         };
-        let pointwise_cfg = nn::ConvConfig {
+        let pointwise_cfg = |groups| nn::ConvConfig {
+            groups,
             bias: false,
             ..Default::default()
         };
 
-        let conv1_group = nn::conv1d(&vs / "conv1_group", c_in, c_in, k, grouped_cfg(groups));
+        let conv1_group = nn::conv1d(&vs / "conv1_group", c_in, c_in, k, grouped_cfg(g_in));
         let bn1_group = nn::batch_norm1d(&vs / "bn1_group", c_in, bn_cfg());
-        let conv1_pw = nn::conv1d(&vs / "conv1_pw", c_in, c_out, 1, pointwise_cfg);
+        let conv1_pw = nn::conv1d(&vs / "conv1_pw", c_in, c_out, 1, pointwise_cfg(pw_groups));
         let bn1_pw = nn::batch_norm1d(&vs / "bn1_pw", c_out, bn_cfg());
 
-        let conv2_group = nn::conv1d(&vs / "conv2_group", c_out, c_out, k, grouped_cfg(groups));
+        let conv2_group = nn::conv1d(&vs / "conv2_group", c_out, c_out, k, grouped_cfg(g_out));
         let bn2_group = nn::batch_norm1d(&vs / "bn2_group", c_out, bn_cfg());
-        let conv2_pw = nn::conv1d(&vs / "conv2_pw", c_out, c_out, 1, pointwise_cfg);
+        let conv2_pw = nn::conv1d(&vs / "conv2_pw", c_out, c_out, 1, pointwise_cfg(1));
         let bn2_pw = nn::batch_norm1d(&vs / "bn2_pw", c_out, bn_cfg());
 
         let downsample = (c_in != c_out).then(|| {
             (
-                nn::conv1d(&vs / "ds_conv", c_in, c_out, 1, pointwise_cfg),
+                nn::conv1d(&vs / "ds_conv", c_in, c_out, 1, pointwise_cfg(pw_groups)),
                 nn::batch_norm1d(&vs / "ds_bn", c_out, bn_cfg()),
             )
         });
