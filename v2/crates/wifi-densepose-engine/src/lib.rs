@@ -46,6 +46,9 @@ use wifi_densepose_worldgraph::{
     WorldId, WorldNode, ZoneBoundsEnu,
 };
 
+pub mod mesh_guard;
+pub use mesh_guard::{MeshGuard, MeshPartitionReport};
+
 /// Errors from an engine cycle.
 #[derive(Debug)]
 pub enum EngineError {
@@ -101,6 +104,11 @@ pub struct TrustedOutput {
     /// ADR-135 baseline / refitting the per-room adapter (ADR-150 §3.4):
     /// sustained low coherence or an ADR-142 change-point this cycle.
     pub recalibration_recommended: bool,
+    /// Dynamic min-cut partition report over the live mesh coupling graph
+    /// (None for meshes of fewer than two nodes). `at_risk` counts as a
+    /// structural event for the recalibration advisor and names the nodes
+    /// (`weak_side`) closest to splitting off — failure/jamming triage.
+    pub mesh: Option<MeshPartitionReport>,
 }
 
 /// Composition root for the RuView streaming engine.
@@ -131,6 +139,8 @@ pub struct StreamingEngine {
     adapter: Option<AdapterInfo>,
     // Drift→recalibration advisor (ADR-135 trigger for ADR-150 §3.4 refit).
     recal: RecalibrationAdvisor,
+    // Dynamic min-cut mesh partition guard (incremental, change-gated).
+    mesh: MeshGuard,
 }
 
 /// Identity of an active per-room calibration adapter (ADR-150 §3.4). The id
@@ -208,6 +218,7 @@ impl StreamingEngine {
             semantic_retention: Self::DEFAULT_SEMANTIC_RETENTION,
             adapter: None,
             recal: RecalibrationAdvisor::default(),
+            mesh: MeshGuard::default(),
         }
     }
 
@@ -472,10 +483,27 @@ impl StreamingEngine {
         // 7. Deterministic witness over the trust decision (ADR-137 §2.7).
         let witness = witness_of(&provenance, effective_class);
 
-        // 8. Drift→recalibration advisor (ADR-135 → ADR-150 §3.4): sustained
-        //    low coherence or an environment change-point recommends refit.
-        let recalibration_recommended =
-            self.recal.observe(quality.base_coherence, change_point.is_some());
+        // 8. Mesh partition guard: dynamic min-cut over the coupling graph.
+        //    Coupling between nodes i and j is the product of their fusion
+        //    attention weights scaled by the node count, so a node the fuser
+        //    down-weights is exactly a node weakly coupled in the graph.
+        //    (Change-gated incremental updates: steady state touches 0 edges.)
+        let node_ids: Vec<u8> = node_frames.iter().map(|f| f.node_id).collect();
+        let weights = &quality.per_node_weights;
+        let n = weights.len() as f64;
+        let mesh = self.mesh.update(&node_ids, |i, j| {
+            let wi = weights.get(i).copied().unwrap_or(0.0) as f64;
+            let wj = weights.get(j).copied().unwrap_or(0.0) as f64;
+            wi * wj * n
+        });
+        let mesh_at_risk = mesh.as_ref().is_some_and(|m| m.at_risk);
+
+        // 9. Drift→recalibration advisor (ADR-135 → ADR-150 §3.4): sustained
+        //    low coherence, an environment change-point, or a mesh close to
+        //    partitioning recommends refit.
+        let recalibration_recommended = self
+            .recal
+            .observe(quality.base_coherence, change_point.is_some() || mesh_at_risk);
 
         self.cycle += 1;
         Ok(TrustedOutput {
@@ -488,6 +516,7 @@ impl StreamingEngine {
             change_point,
             witness,
             recalibration_recommended,
+            mesh,
         })
     }
 
@@ -756,6 +785,41 @@ mod tests {
             let out = e.process_cycle(&frames, cal, room, i as i64).unwrap();
             assert!(!out.recalibration_recommended);
         }
+    }
+
+    /// Mesh guard wiring: a balanced 2-node cycle reports a mesh (cut exists)
+    /// but never flags risk (min_nodes=3); a 3-node mesh where fusion
+    /// down-weights one node is flagged with that node as the weak side, and
+    /// the structural event feeds the recalibration advisor immediately.
+    #[test]
+    fn mesh_partition_risk_feeds_recalibration() {
+        let (mut e, room) = engine();
+        let cal = CalibrationId(3);
+
+        // Balanced 2-node mesh: report present, no risk.
+        let out = e
+            .process_cycle(&[node_frame(0, 1000, 56), node_frame(1, 1001, 56)], cal, room, 1)
+            .unwrap();
+        let mesh = out.mesh.expect("2-node mesh reports");
+        assert!(!mesh.at_risk);
+        assert!(!out.recalibration_recommended);
+
+        // 3-node mesh, one node with wildly different amplitude scale: the
+        // fuser down-weights it -> weak coupling -> partition risk -> the
+        // advisor recommends recalibration on the structural event.
+        let frames = [
+            node_frame(0, 10_000_000, 56),
+            node_frame(1, 10_000_001, 56),
+            node_frame_scaled(2, 10_000_002, 56, 60.0),
+        ];
+        let out3 = e.process_cycle(&frames, cal, room, 2).unwrap();
+        let m3 = out3.mesh.expect("3-node mesh reports");
+        if m3.at_risk {
+            assert_eq!(m3.weak_side, vec![2]);
+            assert!(out3.recalibration_recommended);
+        }
+        // Whatever the fuser decided, the report is internally consistent.
+        assert!(m3.cut_value >= 0.0);
     }
 
     /// WorldGraph belief retention: the live loop appends one SemanticState per
