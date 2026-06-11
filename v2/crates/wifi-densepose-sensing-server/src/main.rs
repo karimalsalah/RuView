@@ -1038,15 +1038,12 @@ struct AppStateInner {
     /// Attention-weighted multi-node CSI fusion engine.
     multistatic_fuser: MultistaticFuser,
     /// Governed trust-path bridge (ADR-135..146): runs the same live frames
-    /// through the privacy/provenance/witness control plane. Additive — does not
-    /// affect person-count behavior; produces the auditable belief + witness.
+    /// through the privacy/provenance/witness control plane. Does not alter
+    /// person-count behavior; its trust state (witness, effective class,
+    /// recalibration flag, error count) is recorded on the bridge itself and
+    /// exposed via `GET /api/v1/status`, and a Restricted-class cycle strips
+    /// per-node raw amplitudes from the live publish (review finding 1).
     engine_bridge: engine_bridge::EngineBridge,
-    /// Witness of the most recent governed trust cycle (BLAKE3), for audit/UI.
-    pub(crate) last_trust_witness: Option<[u8; 32]>,
-    /// Latest drift→recalibration recommendation from the governed engine
-    /// (ADR-135 → ADR-150 §3.4): sustained low coherence or a change-point
-    /// suggests re-running the empty-room baseline / refitting the room adapter.
-    pub(crate) recalibration_recommended: bool,
     /// SVD-based room field model for eigenvalue person counting (None until calibration).
     field_model: Option<FieldModel>,
     // ── ADR-044 §5.2: adaptive rolling-p95 normalization ─────────────────────
@@ -3807,11 +3804,31 @@ async fn health_live(State(state): State<SharedState>) -> Json<serde_json::Value
     }))
 }
 
+/// Lowercase hex of a 32-byte witness for JSON exposure.
+fn witness_hex(w: [u8; 32]) -> String {
+    use std::fmt::Write;
+    w.iter().fold(String::with_capacity(64), |mut acc, b| {
+        let _ = write!(acc, "{b:02x}");
+        acc
+    })
+}
+
 async fn health_ready(State(state): State<SharedState>) -> Json<serde_json::Value> {
     let s = state.read().await;
     Json(serde_json::json!({
         "status": "ready",
         "source": s.effective_source(),
+        // Governed trust-path state (ADR-135..146; review finding 1b): latest
+        // witness + privacy class + recalibration flag, and the engine error
+        // audit — previously write-only on AppState, now readable here.
+        "trust": {
+            "last_witness": s.engine_bridge.last_trust_witness().map(witness_hex),
+            "effective_class": s.engine_bridge.effective_class().map(|c| format!("{c:?}")),
+            "demoted": s.engine_bridge.demoted(),
+            "recalibration_recommended": s.engine_bridge.recalibration_recommended(),
+            "engine_error_count": s.engine_bridge.engine_error_count(),
+            "raw_outputs_suppressed": s.engine_bridge.suppress_raw_outputs(),
+        },
     }))
 }
 
@@ -5061,20 +5078,17 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
 
                     // Governed trust cycle (ADR-135..146): run the same live
                     // frames through the privacy/provenance/witness control
-                    // plane. Split-borrow the two distinct fields off the guard.
+                    // plane. Trust state is recorded on the bridge (exposed on
+                    // /api/v1/status); engine errors are counted + rate-limit
+                    // logged instead of being swallowed (review finding 1).
+                    // Split-borrow the two distinct fields off the guard.
                     {
                         let sref: &mut AppStateInner = &mut s;
                         let now_ms = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_millis() as i64)
                             .unwrap_or(0);
-                        if let Some(Ok(trust)) = sref
-                            .engine_bridge
-                            .process_cycle_from_states(&sref.node_states, now_ms)
-                        {
-                            sref.last_trust_witness = Some(trust.witness);
-                            sref.recalibration_recommended = trust.recalibration_recommended;
-                        }
+                        sref.engine_bridge.observe_cycle(&sref.node_states, now_ms);
                     }
 
                     // Feed field model calibration if active (use per-node history for ESP32).
@@ -5531,20 +5545,17 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
 
                     // Governed trust cycle (ADR-135..146): run the same live
                     // frames through the privacy/provenance/witness control
-                    // plane. Split-borrow the two distinct fields off the guard.
+                    // plane. Trust state is recorded on the bridge (exposed on
+                    // /api/v1/status); engine errors are counted + rate-limit
+                    // logged instead of being swallowed (review finding 1).
+                    // Split-borrow the two distinct fields off the guard.
                     {
                         let sref: &mut AppStateInner = &mut s;
                         let now_ms = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_millis() as i64)
                             .unwrap_or(0);
-                        if let Some(Ok(trust)) = sref
-                            .engine_bridge
-                            .process_cycle_from_states(&sref.node_states, now_ms)
-                        {
-                            sref.last_trust_witness = Some(trust.witness);
-                            sref.recalibration_recommended = trust.recalibration_recommended;
-                        }
+                        sref.engine_bridge.observe_cycle(&sref.node_states, now_ms);
                     }
 
                     // Feed field model calibration if active (use per-node history for ESP32).
@@ -5558,7 +5569,15 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                         }
                     }
 
-                    // Build nodes array with all active nodes.
+                    // Build nodes array with all active nodes. ADR-141 output
+                    // gating (review finding 1c): when the governed engine
+                    // emitted this cycle at class Restricted (base mode, or a
+                    // contradiction/mesh-risk demotion below the configured
+                    // class), the per-node raw amplitude vectors are suppressed
+                    // from the live publish — the same field mapping bfld's
+                    // privacy gate applies at Restricted (drop amplitude/phase
+                    // proxies).
+                    let suppress_raw = s.engine_bridge.suppress_raw_outputs();
                     let active_nodes: Vec<NodeInfo> = s
                         .node_states
                         .iter()
@@ -5570,12 +5589,19 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                             node_id: id,
                             rssi_dbm: n.rssi_history.back().copied().unwrap_or(0.0),
                             position: [2.0, 0.0, 1.5],
-                            amplitude: n
-                                .frame_history
-                                .back()
-                                .map(|a| a.iter().take(56).cloned().collect())
-                                .unwrap_or_default(),
-                            subcarrier_count: n.frame_history.back().map_or(0, |a| a.len()),
+                            amplitude: if suppress_raw {
+                                vec![]
+                            } else {
+                                n.frame_history
+                                    .back()
+                                    .map(|a| a.iter().take(56).cloned().collect())
+                                    .unwrap_or_default()
+                            },
+                            subcarrier_count: if suppress_raw {
+                                0
+                            } else {
+                                n.frame_history.back().map_or(0, |a| a.len())
+                            },
                             // ADR-110 iter 23 / iter 30 — single source of truth.
                             sync: n.sync_snapshot(),
                         })
@@ -6864,8 +6890,6 @@ async fn main() {
             "default",
             "Default Room",
         ),
-        last_trust_witness: None,
-        recalibration_recommended: false,
         field_model: if args.calibrate {
             info!("Field model calibration enabled — room should be empty during startup");
             FieldModel::new(field_bridge::single_link_config()).ok()

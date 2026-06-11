@@ -21,6 +21,11 @@
 //! 3. **Pre-registered thresholds + bootstrap CI.** The gate compares the
 //!    *lower* bound of a deterministic 95% bootstrap CI, not the point estimate,
 //!    so a lucky small-sample result cannot pass.
+//! 4. **No degenerate test sets.** The test set must contain *both* truth
+//!    classes (present-rate ≥ `min_positive_rate`, and at least one absent
+//!    sample), with its own failure flag — an all-absent set plus an
+//!    always-absent predictor must never release a claim. Vacuous F1 (no
+//!    positives anywhere in the confusion) scores **0.0**, never 1.0.
 //!
 //! The harness is the same shape as the `ruview-gamma` acceptance gate: a single
 //! `claim_allowed` invariant, and the claim string is unreadable except through
@@ -154,6 +159,13 @@ pub struct BenchmarkCriteria {
     pub max_count_mae: f64,
     /// Minimum test samples to grade at all (small-N guard).
     pub min_test_samples: usize,
+    /// Minimum fraction of ground-truth **present** samples in the test set
+    /// (degenerate-test-set guard, review finding 2): an all-absent (or
+    /// nearly all-absent) test set makes presence F1 vacuous — an
+    /// always-absent predictor must not be able to release a claim. The gate
+    /// additionally requires at least one ground-truth *absent* sample, so
+    /// both classes must be represented.
+    pub min_positive_rate: f64,
     /// Bootstrap resamples for the CI.
     pub bootstrap_iters: usize,
     /// Deterministic bootstrap seed.
@@ -166,6 +178,7 @@ impl Default for BenchmarkCriteria {
             min_presence_f1: 0.9,
             max_count_mae: 0.5,
             min_test_samples: 30,
+            min_positive_rate: 0.1,
             bootstrap_iters: 1000,
             bootstrap_seed: 42,
         }
@@ -199,7 +212,10 @@ pub struct BenchmarkReport {
     pub count_pass: bool,
     /// Test set is large enough to grade.
     pub sample_size_pass: bool,
-    /// All five criteria pass.
+    /// Test set contains both truth classes with at least `min_positive_rate`
+    /// present-true samples (degenerate test set ⇒ fail, own failure reason).
+    pub class_balance_pass: bool,
+    /// All six criteria pass.
     pub overall_pass: bool,
     /// The released claim string (or [`NO_CLAIM`]).
     pub released_claim: String,
@@ -213,17 +229,24 @@ impl BenchmarkReport {
 }
 
 /// **The single claim invariant.** A SOTA/accuracy claim is releasable only when
-/// the data is measured, the split is leak-free, the sample is large enough, and
-/// both the (CI-lower) presence F1 and the count MAE clear their thresholds.
+/// the data is measured, the split is leak-free, the sample is large enough,
+/// the test set is non-degenerate (both classes represented), and both the
+/// (CI-lower) presence F1 and the count MAE clear their thresholds.
 #[inline]
 pub fn claim_allowed(
     provenance_pass: bool,
     split_pass: bool,
     sample_size_pass: bool,
+    class_balance_pass: bool,
     presence_pass: bool,
     count_pass: bool,
 ) -> bool {
-    provenance_pass && split_pass && sample_size_pass && presence_pass && count_pass
+    provenance_pass
+        && split_pass
+        && sample_size_pass
+        && class_balance_pass
+        && presence_pass
+        && count_pass
 }
 
 /// Grade the test split of `samples` under `criteria`.
@@ -249,7 +272,11 @@ pub fn evaluate(
     let (mut tp, mut fp, mut tn, mut fn_) = (0u64, 0u64, 0u64, 0u64);
     let mut count_abs_err_sum = 0.0;
     let mut count_exact = 0u64;
+    let mut truth_present = 0u64;
     for s in &test {
+        if s.truth.present {
+            truth_present += 1;
+        }
         match (s.predicted.present, s.truth.present) {
             (true, true) => tp += 1,
             (true, false) => fp += 1,
@@ -282,6 +309,17 @@ pub fn evaluate(
 
     let provenance_pass = provenance.is_claimable();
     let sample_size_pass = n_test >= criteria.min_test_samples;
+    // Degenerate-test-set guard (review finding 2): both truth classes must be
+    // represented — at least `min_positive_rate` present samples AND at least
+    // one absent sample. Otherwise the F1/accuracy numbers are vacuous (an
+    // all-absent set is aced by a predictor that always says "absent").
+    let positive_rate = if n_test > 0 {
+        truth_present as f64 / n_test as f64
+    } else {
+        0.0
+    };
+    let class_balance_pass =
+        n_test > 0 && positive_rate >= criteria.min_positive_rate && truth_present < n_test as u64;
     // Gate on the LOWER CI bound, not the point estimate (small-N guard).
     let presence_pass = presence_f1_ci.0 >= criteria.min_presence_f1;
     let count_pass = count_mae <= criteria.max_count_mae;
@@ -289,6 +327,7 @@ pub fn evaluate(
         provenance_pass,
         split_pass,
         sample_size_pass,
+        class_balance_pass,
         presence_pass,
         count_pass,
     );
@@ -315,6 +354,7 @@ pub fn evaluate(
         presence_pass,
         count_pass,
         sample_size_pass,
+        class_balance_pass,
         overall_pass,
         released_claim,
     }
@@ -323,9 +363,12 @@ pub fn evaluate(
 fn f1_from_confusion(tp: u64, fp: u64, fn_: u64) -> f64 {
     let denom = 2 * tp + fp + fn_;
     if denom == 0 {
-        // No positives anywhere: define F1 = 1.0 only if there were also no
-        // predicted/actual positives at all (vacuous), else 0.0.
-        return if fp == 0 && fn_ == 0 { 1.0 } else { 0.0 };
+        // No positives anywhere (tp = fp = fn = 0): F1 is undefined, and the
+        // vacuous case must score 0.0, never 1.0 — an all-absent test set plus
+        // an always-absent predictor was previously awarded a perfect F1
+        // (review finding 2). The class-balance criterion independently fails
+        // such a degenerate set with its own reason.
+        return 0.0;
     }
     (2 * tp) as f64 / denom as f64
 }
@@ -479,29 +522,101 @@ mod tests {
         assert!(!r.overall_pass);
     }
 
+    /// The probative CI-gate case (review finding 10): a test set whose POINT
+    /// F1 clears the 0.9 threshold while the bootstrap CI LOWER bound falls
+    /// below it — the claim must be withheld. A point-estimate gate would
+    /// (wrongly) release here.
     #[test]
     fn gate_uses_ci_lower_bound_not_point_estimate() {
-        // A predictor that is right most of the time but with enough errors that
-        // the bootstrap LOWER bound dips below the 0.9 threshold even if the
-        // point F1 is near it.
         let mut samples = Vec::new();
         for i in 0..40 {
-            samples.push(sample(&format!("train-{i}"), &format!("te-{i}"), (true, 1), (true, 1)));
+            samples.push(sample(
+                &format!("train-{i}"),
+                &format!("te-{i}"),
+                (i % 2 == 0, 1),
+                (i % 2 == 0, 1),
+            ));
         }
+        // Test: 20 truth-present / 20 truth-absent (class-balanced). All
+        // absents predicted correctly; 3 of the 20 presents missed (FN).
+        // Point F1 = 2·17/(2·17 + 0 + 3) = 34/37 ≈ 0.919 ≥ 0.9, but resamples
+        // drawing 4+ of the FNs push F1 below 0.9, so the 2.5th percentile
+        // lands under the threshold.
         for i in 0..40 {
-            // ~15% false negatives in test
-            let correct = i % 7 != 0;
+            let truth_present = i < 20;
+            let predicted_present = truth_present && i >= 3; // i 0..3 → FN
             samples.push(sample(
                 &format!("test-{i}"),
                 &format!("tn-{i}"),
-                (true, 1),
-                (correct, 1),
+                (truth_present, u32::from(truth_present)),
+                (predicted_present, u32::from(truth_present)),
             ));
         }
         let split = EvalSplit { train_idx: (0..40).collect(), test_idx: (40..80).collect() };
+        let criteria = BenchmarkCriteria::default();
+        let r = evaluate(&samples, DataProvenance::Measured, &split, &criteria);
+        // Construct verified: point estimate above the threshold...
+        assert!(
+            r.presence_f1 >= criteria.min_presence_f1,
+            "fixture must put the point estimate ({:.3}) above the threshold",
+            r.presence_f1
+        );
+        // ...while the CI lower bound is below it...
+        assert!(
+            r.presence_f1_ci.0 < criteria.min_presence_f1,
+            "fixture must put the CI lower bound ({:.3}) below the threshold",
+            r.presence_f1_ci.0
+        );
+        // ...and the claim is therefore withheld.
+        assert!(!r.presence_pass);
+        assert!(!r.overall_pass);
+        assert_eq!(r.claim(), NO_CLAIM);
+        // Every other criterion passes, isolating the CI gate as the cause.
+        assert!(r.provenance_pass && r.split_pass && r.sample_size_pass);
+        assert!(r.class_balance_pass && r.count_pass);
+    }
+
+    /// Degenerate test set (review finding 2): all-absent ground truth plus an
+    /// always-absent predictor must NOT release a claim — F1 is vacuous (0.0,
+    /// not 1.0) and the class-balance criterion fails with its own flag.
+    #[test]
+    fn all_absent_test_set_is_degenerate_and_withheld() {
+        let mut samples = Vec::new();
+        for i in 0..40 {
+            samples.push(sample(&format!("tr-{i}"), &format!("te-{i}"), (true, 1), (true, 1)));
+        }
+        for i in 0..40 {
+            // Truth all absent; predictor always says absent → tp=fp=fn=0.
+            samples.push(sample(&format!("ts-{i}"), &format!("ev-{i}"), (false, 0), (false, 0)));
+        }
+        let split = EvalSplit { train_idx: (0..40).collect(), test_idx: (40..80).collect() };
         let r = evaluate(&samples, DataProvenance::Measured, &split, &BenchmarkCriteria::default());
-        // CI lower bound is below the point estimate.
-        assert!(r.presence_f1_ci.0 <= r.presence_f1);
+        // Vacuous F1 scores 0.0 (was 1.0 before the fix).
+        assert_eq!(r.presence_f1, 0.0);
+        assert_eq!(r.presence_f1_ci, (0.0, 0.0));
+        // Degeneracy is named as its own failed criterion.
+        assert!(!r.class_balance_pass);
+        assert!(!r.overall_pass);
+        assert_eq!(r.claim(), NO_CLAIM);
+    }
+
+    /// The mirror degeneracy: an all-PRESENT test set (no absent samples) is
+    /// also refused — a trivially always-present predictor would ace it.
+    #[test]
+    fn all_present_test_set_is_degenerate_and_withheld() {
+        let mut samples = Vec::new();
+        for i in 0..40 {
+            samples.push(sample(&format!("tr-{i}"), &format!("te-{i}"), (i % 2 == 0, 1), (i % 2 == 0, 1)));
+        }
+        for i in 0..40 {
+            samples.push(sample(&format!("ts-{i}"), &format!("ev-{i}"), (true, 1), (true, 1)));
+        }
+        let split = EvalSplit { train_idx: (0..40).collect(), test_idx: (40..80).collect() };
+        let r = evaluate(&samples, DataProvenance::Measured, &split, &BenchmarkCriteria::default());
+        assert!((r.presence_f1 - 1.0).abs() < 1e-9, "metric still computed");
+        assert!(!r.class_balance_pass, "single-class test set is degenerate");
+        assert!(!r.overall_pass);
+        assert_eq!(r.claim(), NO_CLAIM);
     }
 
     #[test]
@@ -518,29 +633,36 @@ mod tests {
         for i in 0..40 {
             samples.push(sample(&format!("tr-{i}"), &format!("te-{i}"), (true, 1), (true, 1)));
         }
+        // Class-balanced test set (so count MAE is the ONLY failing criterion):
+        // presence perfect, but the count is always off by 2 -> MAE 2.0 > 0.5.
         for i in 0..40 {
-            // presence perfect, but count is always off by 2 -> MAE 2.0 > 0.5
-            samples.push(sample(&format!("ts-{i}"), &format!("ev-{i}"), (true, 1), (true, 3)));
+            let present = i % 2 == 0;
+            let truth_count = u32::from(present);
+            samples.push(sample(
+                &format!("ts-{i}"),
+                &format!("ev-{i}"),
+                (present, truth_count),
+                (present, truth_count + 2),
+            ));
         }
         let split = EvalSplit { train_idx: (0..40).collect(), test_idx: (40..80).collect() };
         let r = evaluate(&samples, DataProvenance::Measured, &split, &BenchmarkCriteria::default());
         assert!(r.presence_pass);
+        assert!(r.class_balance_pass);
         assert!(!r.count_pass);
         assert!(!r.overall_pass);
     }
 
     #[test]
-    fn claim_invariant_requires_all_five() {
-        assert!(claim_allowed(true, true, true, true, true));
-        let one_false = [
-            (false, true, true, true, true),
-            (true, false, true, true, true),
-            (true, true, false, true, true),
-            (true, true, true, false, true),
-            (true, true, true, true, false),
-        ];
-        for (a, b, c, d, e) in one_false {
-            assert!(!claim_allowed(a, b, c, d, e));
+    fn claim_invariant_requires_all_six() {
+        assert!(claim_allowed(true, true, true, true, true, true));
+        // Every single-false combination is denied.
+        for i in 0..6 {
+            let v: Vec<bool> = (0..6).map(|j| j != i).collect();
+            assert!(
+                !claim_allowed(v[0], v[1], v[2], v[3], v[4], v[5]),
+                "criterion {i} false must deny the claim"
+            );
         }
     }
 }

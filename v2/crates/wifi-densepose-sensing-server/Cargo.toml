@@ -54,9 +54,10 @@ wifi-densepose-signal = { version = "0.3.1", path = "../wifi-densepose-signal", 
 wifi-densepose-hardware = { version = "0.3.0", path = "../wifi-densepose-hardware" }
 
 # Governed streaming engine (ADR-135..146): fusion + privacy demotion +
-# WorldGraph belief + deterministic witness. Wiring the live server data through
-# this is what makes the trust/privacy control plane non-bypassable (the live
-# 20 Hz path) — see engine_bridge.rs.
+# WorldGraph belief + deterministic witness. The live server data runs through
+# this as a governed path whose Restricted-class decision strips per-node raw
+# amplitudes from the live publish; full output gating is a tracked follow-up —
+# see engine_bridge.rs ("Honest scope of the live-path governance").
 wifi-densepose-engine = { version = "0.3.0", path = "../wifi-densepose-engine" }
 wifi-densepose-worldgraph = { version = "0.3.0", path = "../wifi-densepose-worldgraph" }
 wifi-densepose-bfld = { version = "0.3.1", path = "../wifi-densepose-bfld", default-features = false }

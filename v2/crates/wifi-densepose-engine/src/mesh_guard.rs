@@ -17,7 +17,9 @@
 //!
 //! ## Cost model (the optimization)
 //!
-//! Weights are quantized (default 1/64) and updates are **change-gated**: an
+//! Weights are quantized (default 1/64; a *nonzero* coupling below one quantum
+//! saturates to quantum 1 so a live coupling is never erased — see
+//! [`MeshGuard::weight_quantum`]) and updates are **change-gated**: an
 //! edge is touched only when its quantized weight actually moves, so the
 //! steady-state cycle applies *zero* graph updates and reuses the cached cut —
 //! O(active-changes) per cycle, not O(n²) rebuilds. The exact (deterministic)
@@ -51,6 +53,14 @@ pub struct MeshGuard {
     edges: BTreeMap<(u8, u8), i64>,
     /// Weight quantum: weights are snapped to multiples of this before
     /// comparison/installation, gating out sub-quantum jitter.
+    ///
+    /// Policy: a **nonzero** coupling below one quantum saturates to quantum 1
+    /// instead of quantizing to 0 — quantization never erases a live coupling.
+    /// (Without the floor, a balanced mesh of ≥ 65 nodes — attention weights
+    /// ~1/n ⇒ couplings ~1/n < 1/64 — had every edge erased and was reported
+    /// permanently "already partitioned"/at-risk.) Exact zero stays zero: a
+    /// truly absent coupling *is* a partition. Relative weakness below one
+    /// quantum is not resolved; lower this quantum if that resolution matters.
     pub weight_quantum: f64,
     /// Cut value at or below which the mesh counts as at partition risk.
     pub risk_threshold: f64,
@@ -74,8 +84,17 @@ impl Default for MeshGuard {
 
 impl MeshGuard {
     /// Quantize a raw weight to the guard's grid (floor; weights are ≥ 0).
+    /// Nonzero sub-quantum weights saturate to quantum 1 — see the
+    /// [`Self::weight_quantum`] policy (review finding: sub-quantum couplings
+    /// must not produce a false "already partitioned").
     fn quantize(&self, w: f64) -> i64 {
-        (w.max(0.0) / self.weight_quantum).floor() as i64
+        let w = w.max(0.0);
+        let q = (w / self.weight_quantum).floor() as i64;
+        if q == 0 && w > 0.0 {
+            1
+        } else {
+            q
+        }
     }
 
     /// Update the guard with this cycle's mesh: `nodes` are the contributing
@@ -283,6 +302,51 @@ mod tests {
         let b = run();
         assert_eq!(a.cut_value.to_bits(), b.cut_value.to_bits());
         assert_eq!(a.weak_side, b.weak_side);
+    }
+
+    /// Regression (review finding 3): a balanced mesh of ≥ 65 nodes has every
+    /// pairwise coupling at ~1/n < quantum (1/64). The old floor-to-zero
+    /// quantization erased all edges and reported the mesh permanently
+    /// "already partitioned" (cut 0, at_risk). Nonzero sub-quantum couplings
+    /// now saturate to one quantum, so the mesh reports a healthy cut.
+    #[test]
+    fn large_balanced_mesh_is_not_at_risk() {
+        let mut g = MeshGuard::default();
+        let nodes: Vec<u8> = (0..70u8).collect();
+        // Attention-weight product coupling: (1/n)·(1/n)·n = 1/n ≈ 0.0143 < 1/64.
+        let n = nodes.len() as f64;
+        let r = g.update(&nodes, |_, _| 1.0 / n).expect("70-node mesh");
+        assert!(
+            r.cut_value > 0.0,
+            "live couplings must not quantize to zero"
+        );
+        // Min cut isolates one node: 69 edges × one quantum (1/64) ≈ 1.08,
+        // well above the 0.25 default risk threshold.
+        assert!(r.cut_value > g.risk_threshold);
+        assert!(
+            !r.at_risk,
+            "balanced large mesh must not be at partition risk"
+        );
+        assert!(r.weak_side.len() < nodes.len(), "no false full partition");
+    }
+
+    /// Sub-quantum couplings saturate to one quantum but exact zero is still a
+    /// real partition (the floor must not invent couplings).
+    #[test]
+    fn sub_quantum_saturates_but_zero_stays_zero() {
+        let mut g = MeshGuard::default();
+        // 0.001 < 1/64 everywhere: connected, tiny cut, flagged at risk
+        // (cut = 2 × 1/64 ≈ 0.031 ≤ 0.25) — but NOT "already partitioned".
+        let r = g.update(&[0, 1, 2], |_, _| 0.001).expect("mesh");
+        assert!(r.cut_value > 0.0);
+        assert!(r.at_risk);
+        // Exact zero to node 2: degenerate cut 0, node 2 isolated.
+        let mut g2 = MeshGuard::default();
+        let r2 = g2
+            .update(&[0, 1, 2], |i, j| if i == 2 || j == 2 { 0.0 } else { 0.5 })
+            .expect("mesh");
+        assert_eq!(r2.cut_value, 0.0);
+        assert_eq!(r2.weak_side, vec![2]);
     }
 
     /// A fully partitioned mesh (zero coupling to one node) reports cut 0.

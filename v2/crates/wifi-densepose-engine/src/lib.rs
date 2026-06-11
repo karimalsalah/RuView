@@ -799,10 +799,21 @@ mod tests {
         }
     }
 
+    /// Maximum total coupling mass of an n-node mesh whose attention weights
+    /// sum to 1 (coupling = wᵢ·wⱼ·n): Σ_{i<j} wᵢwⱼ·n = n(1−Σwᵢ²)/2 ≤ (n−1)/2.
+    /// Any cut is a subset of the edges, so every achievable cut value is
+    /// bounded by this mass — a risk threshold at or above it is *guaranteed*
+    /// to be crossed (deterministic fixture, review finding 4).
+    fn max_coupling_mass(n_nodes: usize) -> f64 {
+        (n_nodes as f64 - 1.0) / 2.0
+    }
+
     /// Mesh guard wiring: a balanced 2-node cycle reports a mesh (cut exists)
-    /// but never flags risk (min_nodes=3); a 3-node mesh where fusion
-    /// down-weights one node is flagged with that node as the weak side, and
-    /// the structural event feeds the recalibration advisor immediately.
+    /// but never flags risk (min_nodes=3); a 3-node mesh whose cut value
+    /// *deterministically* falls at or below the configured risk threshold
+    /// (threshold = the provable upper bound on any achievable cut) is flagged
+    /// at_risk, and the structural event feeds the recalibration advisor
+    /// immediately — no conditional assertions (review finding 4).
     #[test]
     fn mesh_partition_risk_feeds_recalibration() {
         let (mut e, room) = engine();
@@ -816,56 +827,62 @@ mod tests {
         assert!(!mesh.at_risk);
         assert!(!out.recalibration_recommended);
 
-        // 3-node mesh, one node with wildly different amplitude scale: the
-        // fuser down-weights it -> weak coupling -> partition risk -> the
-        // advisor recommends recalibration on the structural event.
+        // 3-node mesh with the operator risk threshold set to the provable
+        // cut upper bound: the crossing is deterministic regardless of the
+        // fuser's exact weighting.
+        e.mesh_guard_mut().risk_threshold = max_coupling_mass(3);
         let frames = [
             node_frame(0, 10_000_000, 56),
             node_frame(1, 10_000_001, 56),
-            node_frame_scaled(2, 10_000_002, 56, 60.0),
+            node_frame(2, 10_000_002, 56),
         ];
         let out3 = e.process_cycle(&frames, cal, room, 2).unwrap();
         let m3 = out3.mesh.expect("3-node mesh reports");
-        if m3.at_risk {
-            assert_eq!(m3.weak_side, vec![2]);
-            assert!(out3.recalibration_recommended);
-        }
-        // Whatever the fuser decided, the report is internally consistent.
-        assert!(m3.cut_value >= 0.0);
+        assert!(m3.at_risk, "cut ≤ threshold must flag partition risk");
+        assert!(
+            out3.recalibration_recommended,
+            "mesh risk is a structural event — the advisor must fire immediately, no streak"
+        );
+        assert!(m3.cut_value.is_finite() && m3.cut_value >= 0.0);
     }
 
     /// Mesh partition risk demotes the privacy class and shifts the witness —
     /// a fragmenting array makes the fused belief less trustworthy, so it is
     /// emitted at a more restricted class, and that demotion is auditable.
-    /// Synthetic injection (via a unit hook) so the test does not depend on the
-    /// fuser's exact weighting.
+    /// Both cycles use the *same 3-node topology and frames*; the engines
+    /// differ only in the forced mesh risk, so the witness delta is
+    /// attributable to the risk demotion alone (review finding 4).
     #[test]
     fn mesh_risk_demotes_privacy_and_shifts_witness() {
         let cal = CalibrationId(8);
-        let frames = [node_frame(0, 1000, 56), node_frame(1, 1001, 56)];
-
-        // Baseline: a clean 2-node cycle is not demoted (PrivateHome → Anonymous).
-        let (mut e1, r1) = engine();
-        let base = e1.process_cycle(&frames, cal, r1, 5_000).unwrap();
-        assert!(!base.demoted);
-        assert_eq!(base.effective_class, PrivacyClass::Anonymous);
-
-        // Force the mesh guard to report risk by setting an impossible risk
-        // threshold (any finite cut is ≤ it) on a ≥3-node mesh.
-        let (mut e2, r2) = engine();
-        e2.mesh_guard_mut().risk_threshold = f64::INFINITY;
         let frames3 = [
             node_frame(0, 1000, 56),
             node_frame(1, 1001, 56),
             node_frame(2, 1002, 56),
         ];
+
+        // Baseline: same topology, default risk threshold — clean cycle, not
+        // demoted (PrivateHome → Anonymous), mesh healthy.
+        let (mut e1, r1) = engine();
+        let base = e1.process_cycle(&frames3, cal, r1, 5_000).unwrap();
+        assert!(!base.mesh.as_ref().unwrap().at_risk);
+        assert!(!base.demoted);
+        assert_eq!(base.effective_class, PrivacyClass::Anonymous);
+
+        // Forced risk: identical frames/topology, threshold at the provable
+        // cut upper bound so the crossing is deterministic.
+        let (mut e2, r2) = engine();
+        e2.mesh_guard_mut().risk_threshold = max_coupling_mass(3);
         let risky = e2.process_cycle(&frames3, cal, r2, 5_000).unwrap();
         assert!(risky.mesh.as_ref().unwrap().at_risk);
         assert!(risky.demoted, "mesh risk must demote");
         // PrivateHome base Anonymous(2) → demoted to Restricted(3).
         assert_eq!(risky.effective_class, PrivacyClass::Restricted);
         assert!(risky.provenance.privacy_decision.contains("Restricted"));
-        assert_ne!(risky.witness, base.witness);
+        assert_ne!(
+            risky.witness, base.witness,
+            "same topology, risk-only delta must shift the witness"
+        );
     }
 
     /// WorldGraph belief retention: the live loop appends one SemanticState per

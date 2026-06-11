@@ -563,6 +563,12 @@ impl crate::traits::CanonicalFrame for CsiFrame {
     /// (each fixed-width LE; `device_id` length-prefixed; `calibration_id` as
     /// 16 UUID bytes or 16 zero bytes for `None`) ‖ `(nrows, ncols)` as u32 LE
     /// ‖ complex payload as `ComplexSample::to_le_bytes()` in stream-major order.
+    ///
+    /// # Panics
+    /// If `calibration_id` is `Some(Uuid::nil())`: the nil UUID is the wire
+    /// sentinel for `None`, so encoding it would alias two distinct frames to
+    /// the same bytes (and the same witness hash) — a non-injective encoding
+    /// is refused rather than silently produced.
     fn to_canonical_bytes(&self) -> Vec<u8> {
         let m = &self.metadata;
         // 16 (id) + ~48 (meta) + 8 (shape) + 16 * n_samples
@@ -600,7 +606,17 @@ impl crate::traits::CanonicalFrame for CsiFrame {
         b.extend_from_slice(&m.noise_floor_dbm.to_le_bytes());
         b.extend_from_slice(&m.sequence_number.to_le_bytes());
         match m.calibration_id {
-            Some(id) => b.extend_from_slice(id.as_bytes()),
+            Some(id) => {
+                // Some(nil) would alias the None sentinel on the wire: the
+                // bytes would decode to a *different* frame (calibration_id
+                // None) with the same witness. Refuse the non-injective
+                // encoding (see the trait-impl `# Panics` doc).
+                assert!(
+                    id != Uuid::nil(),
+                    "calibration_id Some(Uuid::nil()) is unencodable: nil is the None sentinel"
+                );
+                b.extend_from_slice(id.as_bytes());
+            }
             None => b.extend_from_slice(&[0u8; 16]),
         }
         b.extend_from_slice(&m.model_id.to_le_bytes());
@@ -653,6 +669,15 @@ pub enum CanonicalDecodeError {
     /// Trailing bytes after the declared payload.
     #[error("{0} trailing bytes after payload")]
     TrailingBytes(usize),
+    /// A reserved region that must be all-zero held nonzero bytes. Accepting
+    /// them would let two distinct byte strings decode to the same frame
+    /// (re-encoding could not reproduce the original — forged bytes would be
+    /// indistinguishable after a replay round-trip).
+    #[error("reserved bytes for {field} must be zero")]
+    ReservedNotZero {
+        /// Which field's reserved region was nonzero.
+        field: &'static str,
+    },
 }
 
 /// Byte cursor for the canonical layout.
@@ -709,8 +734,10 @@ impl CsiFrame {
     ///
     /// # Errors
     /// [`CanonicalDecodeError`] on truncation, bad discriminants, non-UTF-8
-    /// device id, shape/payload disagreement, or trailing bytes — every
-    /// malformed input fails closed.
+    /// device id, nonzero reserved bytes, shape/payload disagreement, or
+    /// trailing bytes — every malformed input fails closed. Strictness
+    /// guarantees injectivity on the accepted domain: any accepted byte
+    /// string re-encodes to exactly itself.
     pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, CanonicalDecodeError> {
         let mut c = Cursor { b: bytes, at: 0 };
 
@@ -740,7 +767,13 @@ impl CsiFrame {
         let spacing_mm = match c.u8()? {
             1 => Some(c.f32()?),
             0 => {
-                c.take(4)?; // reserved zero bytes
+                // Reserved padding must be zero (decoder strictness =
+                // injectivity on the accepted domain): otherwise forged
+                // nonzero padding would decode to the same frame as the
+                // canonical encoding and re-encode differently.
+                if c.take(4)? != [0u8; 4] {
+                    return Err(CanonicalDecodeError::ReservedNotZero { field: "spacing_mm" });
+                }
                 None
             }
             v => {
@@ -1566,6 +1599,54 @@ mod tests {
         // A nil calibration uuid decodes as None (the documented encoding).
         let replayed = CsiFrame::from_canonical_bytes(&bytes).unwrap();
         assert_eq!(replayed.metadata.calibration_id, None);
+    }
+
+    /// AC8b (review finding 7) — decoder strictness = injectivity on the
+    /// accepted domain: forged nonzero bytes in the `spacing_mm` reserved
+    /// region are rejected, so for accepted inputs `re-encode != original`
+    /// is impossible.
+    #[test]
+    fn ac8b_forged_reserved_spacing_bytes_rejected() {
+        use ndarray::Array2;
+        let meta = CsiMetadata::new(DeviceId::new("n"), FrequencyBand::Band2_4GHz, 1);
+        let data = Array2::from_shape_fn((1, 4), |(_, c)| Complex64::new(c as f64, 0.0));
+        let frame = CsiFrame::new(meta, data);
+        let bytes = frame.to_canonical_bytes();
+
+        // Spacing tag sits after id(16)+secs(8)+nanos(4)+dev_len(4)+dev("n"=1)
+        // + band(1)+channel(1)+bw(2)+tx(1)+rx(1); the 4 reserved bytes follow.
+        let tag_off = 16 + 8 + 4 + 4 + 1 + 1 + 1 + 2 + 1 + 1;
+        assert_eq!(bytes[tag_off], 0, "fixture must encode spacing_mm = None");
+        assert_eq!(&bytes[tag_off + 1..tag_off + 5], &[0u8; 4]);
+
+        // Sanity: the canonical bytes decode and re-encode byte-identically.
+        let ok = CsiFrame::from_canonical_bytes(&bytes).unwrap();
+        assert_eq!(ok.to_canonical_bytes(), bytes);
+
+        // Forge each reserved byte: the decoder must fail closed (before the
+        // fix it decoded to the same frame, whose re-encoding differed from
+        // the forged original — a witness-replay ambiguity).
+        for i in 1..=4 {
+            let mut forged = bytes.clone();
+            forged[tag_off + i] = 0xAB;
+            assert!(matches!(
+                CsiFrame::from_canonical_bytes(&forged),
+                Err(CanonicalDecodeError::ReservedNotZero { field: "spacing_mm" })
+            ));
+        }
+    }
+
+    /// AC8c (review finding 7) — `Some(Uuid::nil())` calibration is an
+    /// encoding error: nil is the wire sentinel for `None`, so encoding it
+    /// would alias two distinct frames to one byte string (and one witness).
+    #[test]
+    #[should_panic(expected = "nil is the None sentinel")]
+    fn ac8c_nil_calibration_id_is_an_encoding_error() {
+        use ndarray::Array2;
+        let mut meta = CsiMetadata::new(DeviceId::new("n"), FrequencyBand::Band2_4GHz, 1);
+        meta.calibration_id = Some(uuid::Uuid::nil());
+        let data = Array2::from_shape_fn((1, 2), |(_, c)| Complex64::new(c as f64, 0.0));
+        let _ = CsiFrame::new(meta, data).to_canonical_bytes();
     }
 
     /// AC3 — `serde(default)` forward-read of pre-ADR-136 metadata JSON.
