@@ -462,11 +462,20 @@ export class HudController {
     ctx.clearRect(0, 0, w, h);
     if (this._rssiHistory.length < 2) return;
 
+    // Glow + line weight pulse with recent RSSI variation (= movement).
+    let mean = 0;
+    for (const v of this._rssiHistory) mean += v;
+    mean /= this._rssiHistory.length;
+    let sd = 0;
+    for (const v of this._rssiHistory) sd += (v - mean) * (v - mean);
+    sd = Math.sqrt(sd / this._rssiHistory.length);
+    const motion = Math.min(1, sd / 6);
+
     ctx.beginPath();
-    ctx.strokeStyle = '#2090ff';
-    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = motion > 0.5 ? '#46c8ff' : '#2090ff';
+    ctx.lineWidth = 1.5 + motion * 1.3;
     ctx.shadowColor = '#2090ff';
-    ctx.shadowBlur = 4;
+    ctx.shadowBlur = 4 + motion * 14;
     for (let i = 0; i < this._rssiHistory.length; i++) {
       const x = (i / (this._rssiHistory.length - 1)) * w;
       const norm = Math.max(0, Math.min(1, (this._rssiHistory[i] + 80) / 60));

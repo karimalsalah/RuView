@@ -18,6 +18,7 @@ import { FigurePool, SKELETON_PAIRS } from './figure-pool.js';
 import { PoseSystem } from './pose-system.js';
 import { ScenarioProps } from './scenario-props.js';
 import { HudController, DEFAULTS, SETTINGS_VERSION, PRESETS, SCENARIO_NAMES } from './hud-controller.js';
+import { RfConstellation } from './rf-constellation.js';
 
 // ---- Palette ----
 const C = {
@@ -109,6 +110,7 @@ class Observatory {
     this._buildDotMatrixMist();
     this._buildParticleTrail();
     this._buildWifiWaves();
+    this._rfConstellation = new RfConstellation(this._scene);
     this._buildSignalField();
 
     // Post-processing
@@ -435,30 +437,34 @@ class Observatory {
 
   // ---- WebSocket live data ----
 
-  _autoDetectLive() {
+  _autoDetectLive(attempt = 0) {
     // Probe sensing server health on same origin, then common ports
     const host = window.location.hostname || 'localhost';
-    const candidates = [
-      window.location.origin,                   // same origin (e.g. :3000)
+    const unique = [...new Set([
+      window.location.origin,                   // same origin (serves UI+WS+REST)
       `http://${host}:8765`,                     // default WS port
       `http://${host}:3000`,                     // default HTTP port
-    ];
-    // Deduplicate
-    const unique = [...new Set(candidates)];
+    ])];
 
     const tryNext = (i) => {
       if (i >= unique.length) {
-        console.log('[Observatory] No sensing server detected, using demo mode');
+        // Never silently latch to demo on a flaky first probe — the server may
+        // still be coming up, or the probe raced. Retry the same-origin health
+        // check until we get a real live link (V wants real data, not demo).
+        if (this.settings.dataSource !== 'ws' && attempt < 15) {
+          setTimeout(() => this._autoDetectLive(attempt + 1), 1500);
+        } else if (this.settings.dataSource !== 'ws') {
+          console.log('[Observatory] No sensing server detected, using demo mode');
+        }
         return;
       }
       const base = unique[i];
-      fetch(`${base}/health`, { signal: AbortSignal.timeout(1500) })
+      fetch(`${base}/health`, { signal: AbortSignal.timeout(2500) })
         .then(r => r.ok ? r.json() : Promise.reject())
         .then(data => {
           if (data && data.status === 'ok') {
             const wsProto = base.startsWith('https') ? 'wss:' : 'ws:';
-            const urlObj = new URL(base);
-            const wsUrl = `${wsProto}//${urlObj.host}/ws/sensing`;
+            const wsUrl = `${wsProto}//${new URL(base).host}/ws/sensing`;
             console.log('[Observatory] Sensing server detected at', base, '→', wsUrl);
             this.settings.dataSource = 'ws';
             this.settings.wsUrl = wsUrl;
@@ -480,12 +486,25 @@ class Observatory {
         console.log('[Observatory] WebSocket connected');
         this._hud.updateSourceBadge('ws', this._ws);
       };
-      this._ws.onmessage = (evt) => { try { this._liveData = JSON.parse(evt.data); } catch {} };
+      this._ws.onmessage = (evt) => {
+        try {
+          const msg = JSON.parse(evt.data);
+          // Coalesce bursts: keep only the newest message between frames.
+          if (!this._liveTarget || (msg.timestamp ?? 0) >= (this._liveTarget.timestamp ?? 0)) {
+            this._liveTarget = msg;
+          }
+        } catch {}
+      };
       this._ws.onclose = () => {
-        console.log('[Observatory] WebSocket closed, falling back to demo');
+        console.log('[Observatory] WebSocket closed — auto-reconnecting to live');
         this._ws = null;
-        this.settings.dataSource = 'demo';
         this._hud.updateSourceBadge('demo', null);
+        // Auto-reconnect to the live source rather than latching to demo.
+        if (this.settings.wsUrl) {
+          setTimeout(() => { if (!this._ws) this._connectWS(this.settings.wsUrl); }, 1500);
+        } else {
+          this.settings.dataSource = 'demo';
+        }
       };
       this._ws.onerror = () => {};
     } catch {}
@@ -494,6 +513,44 @@ class Observatory {
   _disconnectWS() {
     if (this._ws) { this._ws.close(); this._ws = null; }
     this._liveData = null;
+    this._liveTarget = null;
+  }
+
+  // Frame-rate-independent smoothing of the numeric features the visuals read,
+  // so real (coarse, 1 dBm-step) RSSI updates render as fluid motion.
+  _smoothLiveData(dt) {
+    const src = this._liveTarget;
+    if (!src) return;
+    if (!this._liveData) { this._liveData = JSON.parse(JSON.stringify(src)); return; }
+    const k = 1 - Math.pow(0.1, dt * 10); // half-life ~70ms, frame-rate independent
+    const d = this._liveData;
+    // Pass structural / non-numeric fields straight through from newest msg.
+    d.tick = src.tick; d.source = src.source; d.timestamp = src.timestamp;
+    d.classification = src.classification;
+    d.persons = src.persons; d.estimated_persons = src.estimated_persons;
+    d.signal_field = src.signal_field; d.vital_signs = src.vital_signs;
+    d.nodes = src.nodes; d.posture = src.posture; d.rf_world = src.rf_world;
+    // Lerp the numeric features.
+    const sf = src.features || {}, df = d.features || (d.features = {});
+    const L = (a, b) => (a == null ? b : a + (b - a) * k);
+    df.mean_rssi = L(df.mean_rssi, sf.mean_rssi);
+    df.variance = L(df.variance, sf.variance);
+    df.motion_band_power = L(df.motion_band_power, sf.motion_band_power);
+    df.spectral_power = L(df.spectral_power, sf.spectral_power);
+  }
+
+  // Scale-free motion energy (0..1) from REAL RSSI variance: a slow "still
+  // floor" and a decaying "motion ceiling" normalize relative movement, so the
+  // visuals react to YOU moving regardless of the link's absolute noise level.
+  _computeMotionEnergy(variance, dt) {
+    if (this._varFloor == null) { this._varFloor = variance; this._varCeil = variance + 1e-6; }
+    this._varFloor += (variance < this._varFloor ? 0.05 : 0.002) * (variance - this._varFloor);
+    if (variance > this._varCeil) this._varCeil = variance;
+    else this._varCeil += (this._varFloor + 1e-6 - this._varCeil) * 0.01;
+    const range = Math.max(this._varCeil - this._varFloor, 1e-3);
+    const e = Math.max(0, Math.min(1, (variance - this._varFloor) / range));
+    this._motionEnergySmooth = (this._motionEnergySmooth ?? 0) * 0.85 + e * 0.15;
+    return this._motionEnergySmooth;
   }
 
   // ========================================
@@ -506,12 +563,16 @@ class Observatory {
     const elapsed = this._clock.getElapsedTime();
 
     // Data source
-    if (this.settings.dataSource === 'ws' && this._liveData) {
+    if (this.settings.dataSource === 'ws' && this._liveTarget) {
+      this._smoothLiveData(dt);
       this._currentData = this._liveData;
     } else {
       this._currentData = this._demoData.update(dt);
     }
     const data = this._currentData;
+
+    // Adaptive motion energy from REAL RSSI variance (drives bloom + glow).
+    this._motionEnergy = this._computeMotionEnergy(data?.features?.variance ?? 0, dt);
 
     // Updates
     this._nebula.update(dt, elapsed);
@@ -520,6 +581,7 @@ class Observatory {
     this._updateDotMatrixMist(data, elapsed);
     this._updateParticleTrail(data, dt, elapsed);
     this._updateWifiWaves(elapsed);
+    this._rfConstellation.update(data, elapsed);
     this._updateSignalField(data);
     this._hud.updateHUD(data, this._demoData);
     this._hud.updateSparkline(data);
@@ -541,6 +603,7 @@ class Observatory {
       this._controls.update();
     }
     this._controls.update();
+    this._postProcessing.setMotionEnergy(this._motionEnergy || 0);
     this._postProcessing.update(elapsed);
     this._postProcessing.render();
     this._updateFPS(dt);

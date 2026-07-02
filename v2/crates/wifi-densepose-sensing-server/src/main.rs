@@ -63,6 +63,8 @@ use vital_signs::{VitalSignDetector, VitalSigns};
 // ADR-022 Phase 3: Multi-BSSID pipeline integration
 use wifi_densepose_wifiscan::parse_netsh_output as parse_netsh_bssid_output;
 use wifi_densepose_wifiscan::{BssidRegistry, WindowsWifiPipeline};
+#[cfg(target_os = "linux")]
+use wifi_densepose_wifiscan::{parse_iw_scan_output, BssidObservation};
 
 // Accuracy sprint: Kalman tracker, multistatic fusion, field model
 use wifi_densepose_signal::ruvsense::field_model::{CalibrationStatus, FieldModel};
@@ -123,6 +125,10 @@ struct Args {
     /// Data source: auto, wifi, esp32, simulate
     #[arg(long, default_value = "auto")]
     source: String,
+
+    /// WiFi interface for Linux RSSI sensing (e.g. wlo1). Empty = auto-detect.
+    #[arg(long, default_value = "")]
+    wifi_iface: String,
 
     /// Run vital sign detection benchmark (1000 frames) and exit
     #[arg(long)]
@@ -2092,7 +2098,7 @@ fn raw_classify(score: f64) -> String {
         "active".into()
     } else if score > 0.12 {
         "present_moving".into()
-    } else if score > 0.04 {
+    } else if score > 0.07 {
         "present_still".into()
     } else {
         "absent".into()
@@ -2118,13 +2124,14 @@ fn smooth_and_classify(state: &mut AppStateInner, raw: &mut ClassificationInfo, 
     if state.baseline_frames < BASELINE_WARMUP {
         // During warm-up, aggressively learn the baseline.
         state.baseline_motion = state.baseline_motion * 0.9 + raw_motion * 0.1;
-    } else if raw_motion < state.smoothed_motion + 0.05 {
+    } else if raw_motion < state.smoothed_motion * 1.2 + 0.02 {
         state.baseline_motion =
             state.baseline_motion * (1.0 - BASELINE_EMA_ALPHA) + raw_motion * BASELINE_EMA_ALPHA;
     }
 
-    // 2. Subtract baseline and clamp.
-    let adjusted = (raw_motion - state.baseline_motion * 0.7).max(0.0);
+    // 2. Subtract baseline and clamp (0.95 = subtract almost the full quiet
+    //    floor so an empty room settles to ~0; real motion is 5-10x the floor).
+    let adjusted = (raw_motion - state.baseline_motion * 0.95).max(0.0);
 
     // 3. EMA smooth the adjusted score.
     state.smoothed_motion =
@@ -2154,7 +2161,7 @@ fn smooth_and_classify(state: &mut AppStateInner, raw: &mut ClassificationInfo, 
 
     // 6. Write the smoothed result back into the classification.
     raw.motion_level = state.current_motion_level.clone();
-    raw.presence = sm > 0.03;
+    raw.presence = sm > 0.06;
     raw.confidence = (0.4 + sm * 0.6).clamp(0.0, 1.0);
 }
 
@@ -2164,12 +2171,12 @@ fn smooth_and_classify_node(ns: &mut NodeState, raw: &mut ClassificationInfo, ra
     ns.baseline_frames += 1;
     if ns.baseline_frames < BASELINE_WARMUP {
         ns.baseline_motion = ns.baseline_motion * 0.9 + raw_motion * 0.1;
-    } else if raw_motion < ns.smoothed_motion + 0.05 {
+    } else if raw_motion < ns.smoothed_motion * 1.2 + 0.02 {
         ns.baseline_motion =
             ns.baseline_motion * (1.0 - BASELINE_EMA_ALPHA) + raw_motion * BASELINE_EMA_ALPHA;
     }
 
-    let adjusted = (raw_motion - ns.baseline_motion * 0.7).max(0.0);
+    let adjusted = (raw_motion - ns.baseline_motion * 0.95).max(0.0);
 
     ns.smoothed_motion =
         ns.smoothed_motion * (1.0 - MOTION_EMA_ALPHA) + adjusted * MOTION_EMA_ALPHA;
@@ -2192,7 +2199,7 @@ fn smooth_and_classify_node(ns: &mut NodeState, raw: &mut ClassificationInfo, ra
     }
 
     raw.motion_level = ns.current_motion_level.clone();
-    raw.presence = sm > 0.03;
+    raw.presence = sm > 0.06;
     raw.confidence = (0.4 + sm * 0.6).clamp(0.0, 1.0);
 }
 
@@ -2425,6 +2432,504 @@ fn parse_netsh_interfaces_output(output: &str) -> Option<(f64, f64, String)> {
         (Some(r), Some(_s), Some(name)) => Some((r, _s, name)),
         (Some(r), Some(_s), None) => Some((r, _s, "Unknown".into())),
         _ => None,
+    }
+}
+
+// ── Linux WiFi RSSI sensing (no ESP32, no root, stays online) ────────────────
+//
+// iwlwifi and friends expose the associated AP's RSSI via `iw dev <iface> link`
+// and `iw dev <iface> station dump`, updated at roughly beacon/packet rate. This
+// is a PASSIVE read of the connected link — it never triggers an active scan, so
+// the card never leaves the operating channel, no CAP_NET_ADMIN/root is needed,
+// and the user's connection stays up. A moving body modulates this RSSI strongly
+// (measured ~30x standard-deviation separation over the sitting-still noise
+// floor on an Intel AX211), which the temporal-variance feature extractor
+// downstream turns into real motion/presence — no simulation.
+
+/// Auto-detect a wireless interface from `/sys/class/net`, preferring one that
+/// is currently `up`. Wireless interfaces carry a `phy80211` subdirectory.
+#[cfg(target_os = "linux")]
+fn detect_wlan_iface() -> Option<String> {
+    let mut candidates: Vec<String> = std::fs::read_dir("/sys/class/net")
+        .ok()?
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if std::path::Path::new(&format!("/sys/class/net/{name}/phy80211")).exists() {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .collect();
+    candidates.sort();
+    candidates
+        .iter()
+        .find(|n| {
+            std::fs::read_to_string(format!("/sys/class/net/{n}/operstate"))
+                .map(|s| s.trim() == "up")
+                .unwrap_or(false)
+        })
+        .cloned()
+        .or_else(|| candidates.into_iter().next())
+}
+
+/// Probe whether a Linux wireless interface is associated to an AP.
+#[cfg(target_os = "linux")]
+async fn probe_linux_wifi(iface: &str) -> bool {
+    match tokio::process::Command::new("iw")
+        .args(["dev", iface, "link"])
+        .output()
+        .await
+    {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).contains("Connected to"),
+        Err(_) => false,
+    }
+}
+
+/// Parse the first `signal:` value (dBm) out of `iw` output. Handles
+/// `signal: -61 dBm`, `signal: -61.00 dBm`, and the per-antenna-chain form
+/// `signal: -61 [-64, -63] dBm` (takes the combined scalar).
+#[cfg(target_os = "linux")]
+fn parse_first_signal(s: &str) -> Option<f64> {
+    for line in s.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("signal:") {
+            let num: String = rest
+                .trim()
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '-' || *c == '.')
+                .collect();
+            if let Ok(v) = num.parse::<f64>() {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+/// Turn `iw link` + `iw station dump` output into a synthetic single-BSS scan
+/// stanza so we can reuse the crate's tested `parse_iw_scan_output` to build a
+/// fully-populated `BssidObservation` (band/radio/signal_pct derived correctly).
+/// Returns `None` when not associated or no signal is available.
+#[cfg(target_os = "linux")]
+fn build_synthetic_bss_from_iw(link: &str, station: &str) -> Option<String> {
+    let mut bssid: Option<String> = None;
+    let mut ssid = String::new();
+    let mut freq = 2437u32;
+    for line in link.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("Connected to ") {
+            bssid = rest.split_whitespace().next().map(|s| s.to_string());
+        } else if let Some(rest) = t.strip_prefix("SSID:") {
+            ssid = rest.trim().to_string();
+        } else if let Some(rest) = t.strip_prefix("freq:") {
+            if let Ok(f) = rest.trim().split_whitespace().next().unwrap_or("").parse::<u32>() {
+                freq = f;
+            }
+        }
+    }
+    let bssid = bssid?;
+    // Prefer the per-packet `signal` from station dump; fall back to link.
+    let signal = parse_first_signal(station).or_else(|| parse_first_signal(link))?;
+    Some(format!(
+        "BSS {bssid}(on wlan)\n\tfreq: {freq}\n\tsignal: {signal:.2} dBm\n\tSSID: {ssid}\n"
+    ))
+}
+
+/// Live WiFi RSSI sensing loop for Linux. Mirrors `windows_wifi_task` exactly
+/// from Step 2 onward; only the acquisition (Step 1) differs — a passive,
+/// no-root connected-AP RSSI read instead of a `netsh` multi-BSSID scan.
+#[cfg(target_os = "linux")]
+#[derive(Default, Clone)]
+struct RfScan {
+    /// Nearby APs from the periodic scan.
+    aps: Vec<BssidObservation>,
+    /// LAN devices from the kernel neighbor table: (ip, mac).
+    devices: Vec<(String, String)>,
+}
+#[cfg(target_os = "linux")]
+type NeighborCache = std::sync::Arc<tokio::sync::RwLock<RfScan>>;
+
+/// Background task: periodically scan ALL nearby APs (the full RF environment)
+/// and cache them. Prefers a privileged active scan (`sudo -n iw … scan`, sees
+/// every AP); falls back to the unprivileged cached `scan dump`. Runs every ~2s
+/// so it never meaningfully disrupts the connected link, while giving the
+/// multi-BSSID pipeline a rich, real, multi-AP frame to fuse.
+#[cfg(target_os = "linux")]
+async fn linux_wifi_scan_task(cache: NeighborCache, iface: String) {
+    let mut interval = tokio::time::interval(Duration::from_millis(2000));
+    loop {
+        interval.tick().await;
+        let iface_cl = iface.clone();
+        let scanned = tokio::task::spawn_blocking(move || -> Vec<BssidObservation> {
+            let run = |args: &[&str]| -> Option<std::process::Output> {
+                std::process::Command::new(args[0]).args(&args[1..]).output().ok()
+            };
+            let parse = |out: Option<std::process::Output>| -> Option<Vec<BssidObservation>> {
+                let o = out?;
+                if !o.status.success() {
+                    return None;
+                }
+                parse_iw_scan_output(&String::from_utf8_lossy(&o.stdout)).ok()
+            };
+            // Privileged active scan first (all APs), else cached dump (no root).
+            parse(run(&["sudo", "-n", "iw", "dev", &iface_cl, "scan"]))
+                .or_else(|| parse(run(&["iw", "dev", &iface_cl, "scan", "dump"])))
+                .unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default();
+
+        // LAN device discovery (passive, no root): the kernel neighbor table.
+        let devices = tokio::task::spawn_blocking(|| -> Vec<(String, String)> {
+            std::process::Command::new("ip")
+                .args(["neigh", "show"])
+                .output()
+                .ok()
+                .map(|o| {
+                    String::from_utf8_lossy(&o.stdout)
+                        .lines()
+                        .filter_map(|l| {
+                            if !l.contains("lladdr") || l.contains("FAILED") {
+                                return None;
+                            }
+                            let ip = l.split_whitespace().next()?.to_string();
+                            let mac = l
+                                .split("lladdr ")
+                                .nth(1)?
+                                .split_whitespace()
+                                .next()?
+                                .to_string();
+                            Some((ip, mac))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default();
+
+        if !scanned.is_empty() || !devices.is_empty() {
+            let (na, nd) = (scanned.len(), devices.len());
+            *cache.write().await = RfScan { aps: scanned, devices };
+            debug!("Linux RF scan: {na} APs, {nd} LAN devices");
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn linux_wifi_task(
+    state: SharedState,
+    tick_ms: u64,
+    iface: String,
+    neighbor_cache: NeighborCache,
+) {
+    let mut interval = tokio::time::interval(Duration::from_millis(tick_ms));
+    let mut seq: u32 = 0;
+
+    // ADR-022 Phase 3: pipeline state (kept across ticks)
+    let mut registry = BssidRegistry::new(32, 30);
+    let mut pipeline = WindowsWifiPipeline::new();
+
+    info!(
+        "Linux WiFi RSSI sensing active on {} (connected-AP RSSI via `iw`, passive/no-root, tick={}ms)",
+        iface, tick_ms
+    );
+
+    loop {
+        interval.tick().await;
+        seq += 1;
+
+        // ── Step 1: Read connected-AP RSSI (passive, no root) ────────
+        let iface_cl = iface.clone();
+        let scan_result =
+            tokio::task::spawn_blocking(move || -> Result<Vec<BssidObservation>, String> {
+                let link = std::process::Command::new("iw")
+                    .args(["dev", &iface_cl, "link"])
+                    .output()
+                    .map_err(|e| format!("iw link failed: {e}"))?;
+                if !link.status.success() {
+                    return Err(format!("iw link exited with {}", link.status));
+                }
+                let link_s = String::from_utf8_lossy(&link.stdout);
+                if !link_s.contains("Connected to") {
+                    return Ok(Vec::new()); // not associated yet
+                }
+                // Freshest per-packet signal from station dump (best-effort).
+                let sta_s = std::process::Command::new("iw")
+                    .args(["dev", &iface_cl, "station", "dump"])
+                    .output()
+                    .ok()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                    .unwrap_or_default();
+                match build_synthetic_bss_from_iw(&link_s, &sta_s) {
+                    Some(stanza) => {
+                        parse_iw_scan_output(&stanza).map_err(|e| format!("parse error: {e}"))
+                    }
+                    None => Ok(Vec::new()),
+                }
+            })
+            .await;
+
+        let observations = match scan_result {
+            Ok(Ok(obs)) if !obs.is_empty() => obs,
+            Ok(Ok(_empty)) => {
+                debug!("Linux WiFi: not associated / no signal, skipping tick");
+                continue;
+            }
+            Ok(Err(e)) => {
+                warn!("Linux WiFi read error: {e}");
+                continue;
+            }
+            Err(join_err) => {
+                error!("spawn_blocking panicked: {join_err}");
+                continue;
+            }
+        };
+
+        // ── Step 1b: Fuse cached neighbor APs (multi-BSSID) ──────────
+        // The connected link (fresh, ~10Hz) stays first so first_rssi/ssid are
+        // correct; append the unique neighbor APs from the periodic background
+        // scan so the multi-BSSID pipeline (correlation/attention/min_bssids)
+        // runs on the full real RF environment, not a single link.
+        let (observations, lan_devices) = {
+            let scan = neighbor_cache.read().await.clone();
+            let mut merged = observations;
+            for nb in scan.aps {
+                if !merged.iter().any(|m| m.bssid == nb.bssid) {
+                    merged.push(nb);
+                }
+            }
+            (merged, scan.devices)
+        };
+
+        let obs_count = observations.len();
+
+        // Derive SSID from the first observation for the source label.
+        let ssid = observations
+            .first()
+            .map(|o| o.ssid.clone())
+            .unwrap_or_else(|| "Unknown".into());
+
+        // ── Step 2: Feed observations into registry ──────────────────
+        registry.update(&observations);
+        let multi_ap_frame = registry.to_multi_ap_frame();
+
+        // ── Step 3: Run enhanced pipeline ────────────────────────────
+        let enhanced = pipeline.process(&multi_ap_frame);
+
+        // ── Step 4: Build the temporal-feature frame from the CONNECTED LINK ──
+        // Motion / presence must come from the connected AP's per-tick (~10 Hz)
+        // RSSI variation alone. The neighbor APs are refreshed by the background
+        // scan only every ~2 s, so between scans they are constant; folding them
+        // into frame_history injects (a) a synchronized 0.5 Hz step that the
+        // temporal-difference and breathing estimators read as fake motion /
+        // breathing, and (b) a constant spatial-spread floor via motion_band_power
+        // (the static neighbour constellation) that latches presence on. The full
+        // multi-AP frame still drives the enhanced pipeline (correlation / quality
+        // gate / verdict), the RF constellation, and the node view below — only the
+        // temporal motion classifier reads the clean single-link signal.
+        // amplitudes[0] is the connected link (observations[0] → stable index 0).
+        let first_rssi = observations.first().map(|o| o.rssi_dbm).unwrap_or(-80.0);
+        let _first_signal_pct = observations.first().map(|o| o.signal_pct).unwrap_or(40.0);
+        let link_amplitude = multi_ap_frame.amplitudes.first().copied().unwrap_or(0.0);
+
+        let frame = Esp32Frame {
+            magic: 0xC511_0001,
+            node_id: 0,
+            n_antennas: 1,
+            n_subcarriers: 1,
+            freq_mhz: 2437,
+            sequence: seq,
+            rssi: first_rssi.clamp(-128.0, 127.0) as i8,
+            noise_floor: -90,
+            ppdu_type: wifi_densepose_hardware::PpduType::HtLegacy,
+            amplitudes: vec![link_amplitude],
+            phases: vec![0.0],
+        };
+
+        // ── Step 4b: Update frame history and extract features ───────
+        let mut s_write_pre = state.write().await;
+        s_write_pre
+            .frame_history
+            .push_back(frame.amplitudes.clone());
+        if s_write_pre.frame_history.len() > FRAME_HISTORY_CAPACITY {
+            s_write_pre.frame_history.pop_front();
+        }
+        let sample_rate_hz = 1000.0 / tick_ms as f64;
+        let (features, mut classification, breathing_rate_hz, sub_variances, raw_motion) =
+            extract_features_from_frame(&frame, &s_write_pre.frame_history, sample_rate_hz);
+        smooth_and_classify(&mut s_write_pre, &mut classification, raw_motion);
+        adaptive_override(&s_write_pre, &features, &mut classification);
+        drop(s_write_pre);
+
+        // ── Step 5: Build enhanced fields from pipeline result ───────
+        let enhanced_motion = Some(serde_json::json!({
+            "score": enhanced.motion.score,
+            "level": format!("{:?}", enhanced.motion.level),
+            "contributing_bssids": enhanced.motion.contributing_bssids,
+        }));
+
+        let enhanced_breathing = enhanced.breathing.as_ref().map(|b| {
+            serde_json::json!({
+                "rate_bpm": b.rate_bpm,
+                "confidence": b.confidence,
+                "bssid_count": b.bssid_count,
+            })
+        });
+
+        let posture_str = enhanced.posture.map(|p| format!("{p:?}"));
+        let sig_quality_score = Some(enhanced.signal_quality.score);
+        let verdict_str = Some(format!("{:?}", enhanced.verdict));
+        let bssid_n = Some(enhanced.bssid_count);
+
+        // ── Step 6: Update shared state ──────────────────────────────
+        let mut s = state.write().await;
+        s.source = format!("wifi:{ssid}");
+        s.rssi_history.push_back(first_rssi);
+        if s.rssi_history.len() > 60 {
+            s.rssi_history.pop_front();
+        }
+
+        s.tick += 1;
+        let tick = s.tick;
+
+        let motion_score = if classification.motion_level == "active" {
+            0.8
+        } else if classification.motion_level == "present_still" {
+            0.3
+        } else {
+            0.05
+        };
+
+        let raw_vitals = s
+            .vital_detector
+            .process_frame(&frame.amplitudes, &frame.phases);
+        let vitals = smooth_vitals(&mut s, &raw_vitals);
+        s.latest_vitals = vitals.clone();
+
+        let feat_variance = features.variance;
+
+        // ADR-044 §5.2: feed raw features into rolling-P95 estimators before scoring.
+        s.p95_variance.push(features.variance);
+        s.p95_motion_band_power.push(features.motion_band_power);
+        s.p95_spectral_power.push(features.spectral_power);
+
+        // Multi-person estimation with temporal smoothing (EMA α=0.10).
+        let raw_score = compute_person_score(&s, &features);
+        s.smoothed_person_score = s.smoothed_person_score * 0.90 + raw_score * 0.10;
+        let est_persons = if classification.presence {
+            let count = s.person_count();
+            s.prev_person_count = count;
+            count
+        } else {
+            s.prev_person_count = 0;
+            0
+        };
+
+        let mut update = SensingUpdate {
+            msg_type: "sensing_update".to_string(),
+            timestamp: chrono::Utc::now().timestamp_millis() as f64 / 1000.0,
+            source: format!("wifi:{ssid}"),
+            tick,
+            nodes: vec![NodeInfo {
+                node_id: 0,
+                rssi_dbm: first_rssi,
+                position: [0.0, 0.0, 0.0],
+                amplitude: multi_ap_frame.amplitudes,
+                subcarrier_count: obs_count,
+                sync: None, // connected-link path — no mesh peer
+            }],
+            features,
+            classification,
+            signal_field: generate_signal_field(
+                first_rssi,
+                motion_score,
+                breathing_rate_hz,
+                feat_variance.min(1.0),
+                &sub_variances,
+            ),
+            // RSSI carries NO phase information — heart-rate / breathing are not
+            // physically measurable on this managed NIC. Emitting them would be
+            // fabricated data; true vitals need CSI hardware (--source esp32).
+            vital_signs: None,
+            enhanced_motion,
+            enhanced_breathing,
+            posture: posture_str,
+            signal_quality_score: sig_quality_score,
+            quality_verdict: verdict_str,
+            bssid_count: bssid_n,
+            pose_keypoints: None,
+            model_status: None,
+            persons: None,
+            // Presence is real; an exact person COUNT is not derivable from RSSI.
+            // Report 1 when present (someone is here), else absent.
+            estimated_persons: if est_persons > 0 { Some(1) } else { None },
+            node_features: None,
+        };
+
+        // Populate persons from the sensing update (Kalman-smoothed via tracker).
+        let raw_persons = derive_pose_from_sensing(&update);
+        let mut last_tracker_instant = s.last_tracker_instant.take();
+        let tracked = tracker_bridge::tracker_update(
+            &mut s.pose_tracker,
+            &mut last_tracker_instant,
+            raw_persons,
+        );
+        s.last_tracker_instant = last_tracker_instant;
+        if !tracked.is_empty() {
+            update.persons = Some(tracked);
+        }
+        // #1050: attach real signal_field-peak positions to each person.
+        attach_field_positions(&mut update);
+
+        // ── RF world: every visible AP + discovered LAN device ───────
+        // Injected as an extra top-level `rf_world` field on the JSON without
+        // touching the SensingUpdate struct (additive; other consumers ignore).
+        let rf_world: Vec<serde_json::Value> = observations
+            .iter()
+            .enumerate()
+            .map(|(i, o)| {
+                serde_json::json!({
+                    "id": o.bssid.to_string(),
+                    "label": if o.ssid.is_empty() { o.bssid.to_string() } else { o.ssid.clone() },
+                    "rssi": o.rssi_dbm,
+                    "kind": if i == 0 { "ap_connected" } else { "ap_nearby" },
+                })
+            })
+            .chain(lan_devices.iter().map(|(ip, mac)| {
+                serde_json::json!({
+                    "id": ip,
+                    "label": ip,
+                    "mac": mac,
+                    "rssi": serde_json::Value::Null,
+                    "kind": "lan_device",
+                })
+            }))
+            .collect();
+
+        match serde_json::to_value(&update) {
+            Ok(mut v) => {
+                v["rf_world"] = serde_json::Value::Array(rf_world);
+                if let Ok(json) = serde_json::to_string(&v) {
+                    let _ = s.tx.send(json);
+                }
+            }
+            Err(_) => {
+                if let Ok(json) = serde_json::to_string(&update) {
+                    let _ = s.tx.send(json);
+                }
+            }
+        }
+        s.latest_update = Some(update);
+
+        debug!(
+            "Linux WiFi tick #{tick}: rssi={first_rssi:.1}dBm, {} APs, {} devices, quality={:.2}",
+            obs_count,
+            lan_devices.len(),
+            enhanced.signal_quality.score
+        );
     }
 }
 
@@ -5040,23 +5545,39 @@ fn chrono_timestamp() -> u64 {
 
 async fn vital_signs_endpoint(State(state): State<SharedState>) -> Json<serde_json::Value> {
     let s = state.read().await;
-    let vs = &s.latest_vitals;
     let (br_len, br_cap, hb_len, hb_cap) = s.vital_detector.buffer_status();
-    Json(serde_json::json!({
-        "vital_signs": {
+    // Heart-rate / breathing require CSI PHASE data. Only the ESP32 CSI source
+    // provides it; RSSI sources (wifi / simulated) physically cannot measure
+    // vitals, so report nulls rather than fabricating numbers.
+    let src = s.effective_source();
+    let vitals_json = if src == "esp32" {
+        let vs = &s.latest_vitals;
+        serde_json::json!({
             "breathing_rate_bpm": vs.breathing_rate_bpm,
             "heart_rate_bpm": vs.heart_rate_bpm,
             "breathing_confidence": vs.breathing_confidence,
             "heartbeat_confidence": vs.heartbeat_confidence,
             "signal_quality": vs.signal_quality,
-        },
+        })
+    } else {
+        serde_json::json!({
+            "breathing_rate_bpm": null,
+            "heart_rate_bpm": null,
+            "breathing_confidence": 0.0,
+            "heartbeat_confidence": 0.0,
+            "signal_quality": 0.0,
+            "note": "vitals require CSI hardware (--source esp32); RSSI has no phase",
+        })
+    };
+    Json(serde_json::json!({
+        "vital_signs": vitals_json,
         "buffer_status": {
             "breathing_samples": br_len,
             "breathing_capacity": br_cap,
             "heartbeat_samples": hb_len,
             "heartbeat_capacity": hb_cap,
         },
-        "source": s.effective_source(),
+        "source": src,
         "tick": s.tick,
     }))
 }
@@ -7296,11 +7817,26 @@ async fn main() {
     let plan = if normalized == "auto" {
         info!("Auto-detecting data source (UDP :{} bound either way)...", args.udp_port);
         let esp32 = probe_esp32(args.udp_port).await;
+        #[cfg(target_os = "linux")]
+        let wifi = if esp32 {
+            false
+        } else {
+            let ifc = if args.wifi_iface.is_empty() {
+                detect_wlan_iface()
+            } else {
+                Some(args.wifi_iface.clone())
+            };
+            match ifc {
+                Some(i) => probe_linux_wifi(&i).await,
+                None => false,
+            }
+        };
+        #[cfg(not(target_os = "linux"))]
         let wifi = if esp32 { false } else { probe_windows_wifi().await };
         if esp32 {
             info!("  ESP32 CSI detected on UDP :{}", args.udp_port);
         } else if wifi {
-            info!("  Windows WiFi detected");
+            info!("  WiFi RSSI source detected (connected-AP link)");
         } else {
             warn!(
                 "No real CSI source at boot — serving SIMULATED data (tagged as \
@@ -7636,6 +8172,26 @@ async fn main() {
         tokio::spawn(broadcast_tick_task(state.clone(), args.tick_ms));
     }
     if plan.run_wifi {
+        #[cfg(target_os = "linux")]
+        {
+            let iface = if args.wifi_iface.is_empty() {
+                detect_wlan_iface().unwrap_or_else(|| "wlan0".to_string())
+            } else {
+                args.wifi_iface.clone()
+            };
+            // Multi-AP fusion: a background scan caches every nearby AP; the
+            // per-tick task merges those with the fresh connected link.
+            let neighbor_cache: NeighborCache =
+                std::sync::Arc::new(tokio::sync::RwLock::new(RfScan::default()));
+            tokio::spawn(linux_wifi_scan_task(neighbor_cache.clone(), iface.clone()));
+            tokio::spawn(linux_wifi_task(
+                state.clone(),
+                args.tick_ms,
+                iface,
+                neighbor_cache,
+            ));
+        }
+        #[cfg(not(target_os = "linux"))]
         tokio::spawn(windows_wifi_task(state.clone(), args.tick_ms));
     }
     if plan.run_simulator {

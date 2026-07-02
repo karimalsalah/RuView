@@ -7,6 +7,7 @@ import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { SMAAPass } from 'three/addons/postprocessing/SMAAPass.js';
 
 const VignetteShader = {
   uniforms: {
@@ -83,11 +84,28 @@ export class PostProcessing {
     );
     this.composer.addPass(this._bloomPass);
 
-    // Vignette + warmth
+    // Bloom that breathes with motion — base strength + motion boost (lerped).
+    this._bloomBase = 0.08;
+    this._bloomBoost = 0.0;
+
+    // SMAA — screen-space anti-aliasing restored after the post chain (the
+    // EffectComposer bypasses the renderer's MSAA), ~0.3ms on a modern GPU.
+    this._smaaPass = new SMAAPass(size.x, size.y);
+    this.composer.addPass(this._smaaPass);
+
+    // Vignette + warmth (final pass)
     this._vignettePass = new ShaderPass(VignetteShader);
     this.composer.addPass(this._vignettePass);
 
     this._bloomEnabled = true;
+  }
+
+  /// Drive bloom from a normalized 0..1 motion energy: peaks flare the glow.
+  setMotionEnergy(energy01) {
+    const target = this._bloomBase + Math.max(0, Math.min(1, energy01)) * 0.55;
+    // Frame-rate-independent ease toward target.
+    this._bloomBoost += (target - this._bloomBoost) * 0.12;
+    if (this._bloomEnabled) this._bloomPass.strength = this._bloomBoost;
   }
 
   update(elapsed) {
@@ -101,6 +119,7 @@ export class PostProcessing {
   resize(width, height) {
     this.composer.setSize(width, height);
     this._bloomPass.resolution.set(width, height);
+    if (this._smaaPass) this._smaaPass.setSize(width, height);
   }
 
   setQuality(level) {
