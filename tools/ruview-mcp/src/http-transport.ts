@@ -13,8 +13,11 @@
  *
  * Security model (ADR-124 §6 + ADR-264 F7):
  *   - Origin validation: browser-style requests whose Origin is not local
- *     are rejected with 403 before reaching the MCP layer. Localhost origins
- *     match on hostname, ANY port (http://localhost:5173 is local).
+ *     are rejected with 403 before reaching the MCP layer. With NO explicit
+ *     allowlist, localhost origins match on hostname, ANY port
+ *     (http://localhost:5173 is local). When an explicit allowedOrigins list is
+ *     configured, matching is exact — the any-port-localhost convenience is off,
+ *     so a localhost peer on an unlisted port must be added to be accepted.
  *   - Bearer token: when RVAGENT_HTTP_TOKEN is set, requests must carry
  *     Authorization: Bearer <token>; missing/wrong tokens → 401.
  *   - Body cap: request bodies over 1 MiB are rejected with 413 (the
@@ -55,6 +58,20 @@ export interface HttpTransportOptions {
   bearerToken?: string;
   /** Maximum accepted request body size in bytes (default: 1 MiB). */
   maxBodyBytes?: number;
+  /**
+   * Maximum number of concurrent live sessions (default: 64). When a new
+   * `initialize` arrives at the cap, the oldest-idle session is evicted (its
+   * transport closed) to make room — bounds memory against a flaky client that
+   * loops `initialize` or a malicious localhost peer (ADR-264 F7).
+   */
+  maxSessions?: number;
+  /**
+   * Idle time-to-live for a session in ms (default: 5 min). Sessions with no
+   * request activity for longer than this are swept and closed.
+   */
+  sessionIdleMs?: number;
+  /** How often the idle-session sweeper runs, in ms (default: 60 s). */
+  sweepIntervalMs?: number;
 }
 
 export interface HttpTransportResult {
@@ -69,6 +86,9 @@ export interface HttpTransportResult {
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 3001;
 const DEFAULT_MAX_BODY_BYTES = 1024 * 1024;
+const DEFAULT_MAX_SESSIONS = 64;
+const DEFAULT_SESSION_IDLE_MS = 5 * 60 * 1000;
+const DEFAULT_SWEEP_INTERVAL_MS = 60 * 1000;
 const LOCAL_HOSTNAMES = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
 /**
@@ -76,8 +96,11 @@ const LOCAL_HOSTNAMES = new Set(["localhost", "127.0.0.1", "[::1]"]);
  * Returns true if the request should be allowed, false if it should be rejected.
  *
  * An absent Origin header is allowed (same-origin non-browser requests, curl,
- * etc.). A localhost origin is allowed on any port (real browser origins carry
- * ports — ADR-264 F7). Anything else must match the allowlist exactly.
+ * etc.). When NO explicit allowlist was configured (empty list), a localhost
+ * origin is allowed on any port as a convenience — real browser origins carry
+ * ports (ADR-264 F7). When an explicit allowlist IS configured, matching is
+ * exact: the any-port-localhost shortcut is disabled so an operator who pins an
+ * allowlist actually gets it (a looped-back peer on an unlisted port is denied).
  */
 export function isOriginAllowed(
   origin: string | undefined,
@@ -86,6 +109,8 @@ export function isOriginAllowed(
   if (origin === undefined) return true; // no Origin = not a cross-origin browser request
   if (allowedOrigins.includes("*")) return true;
   if (allowedOrigins.includes(origin)) return true;
+  // Explicit allowlist ⇒ exact matching only; skip the localhost convenience.
+  if (allowedOrigins.length > 0) return false;
   try {
     const u = new URL(origin);
     return (
@@ -142,7 +167,55 @@ export function buildHttpApp(
   const allowedOrigins: string[] = opts.allowedOrigins ?? [];
   const bearerToken = opts.bearerToken ?? process.env["RVAGENT_HTTP_TOKEN"];
   const maxBodyBytes = opts.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
+  const maxSessions = opts.maxSessions ?? DEFAULT_MAX_SESSIONS;
+  const sessionIdleMs = opts.sessionIdleMs ?? DEFAULT_SESSION_IDLE_MS;
+  const sweepIntervalMs = opts.sweepIntervalMs ?? DEFAULT_SWEEP_INTERVAL_MS;
   const sessions = new Map<string, StreamableHTTPServerTransport>();
+  // lastSeen tracks per-session request activity so the sweeper and the
+  // oldest-idle eviction can bound the session map (ADR-264 F7).
+  const lastSeen = new Map<string, number>();
+
+  /** Mark a session as freshly used. */
+  function touch(sessionId: string): void {
+    lastSeen.set(sessionId, Date.now());
+  }
+
+  /** Close a session's transport and drop it from the bookkeeping maps. */
+  function closeSession(id: string): void {
+    const transport = sessions.get(id);
+    sessions.delete(id);
+    lastSeen.delete(id);
+    if (transport) {
+      try {
+        void transport.close(); // onclose is idempotent against the maps above
+      } catch {
+        /* best-effort: a half-open transport must not block eviction */
+      }
+    }
+  }
+
+  /** Evict the session that has been idle longest — called when at capacity. */
+  function evictOldestIdle(): void {
+    let oldestId: string | undefined;
+    let oldestSeen = Infinity;
+    for (const [id, seen] of lastSeen) {
+      if (seen < oldestSeen) {
+        oldestSeen = seen;
+        oldestId = id;
+      }
+    }
+    if (oldestId !== undefined) closeSession(oldestId);
+  }
+
+  /** Periodic sweep: close sessions idle beyond sessionIdleMs. */
+  function sweepIdleSessions(): void {
+    const now = Date.now();
+    for (const [id, seen] of lastSeen) {
+      if (now - seen > sessionIdleMs) closeSession(id);
+    }
+  }
+  const sweepTimer = setInterval(sweepIdleSessions, sweepIntervalMs);
+  sweepTimer.unref(); // never keep the process alive just to sweep
 
   const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
@@ -194,6 +267,7 @@ export function buildHttpApp(
             json(res, 404, { error: `Unknown session "${sessionId}"` });
             return;
           }
+          touch(sessionId);
           await transport.handleRequest(req, res, parsed);
           return;
         }
@@ -206,14 +280,21 @@ export function buildHttpApp(
           });
           return;
         }
+        // Bound the session map: at capacity, reclaim the oldest-idle slot
+        // before minting a new session (ADR-264 F7).
+        if (sessions.size >= maxSessions) evictOldestIdle();
         const transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (id: string) => {
             sessions.set(id, transport);
+            touch(id);
           },
         });
         transport.onclose = () => {
-          if (transport.sessionId !== undefined) sessions.delete(transport.sessionId);
+          if (transport.sessionId !== undefined) {
+            sessions.delete(transport.sessionId);
+            lastSeen.delete(transport.sessionId);
+          }
         };
         const mcpServer = serverFactory();
         await mcpServer.connect(transport as Parameters<typeof mcpServer.connect>[0]);
@@ -228,6 +309,7 @@ export function buildHttpApp(
           json(res, 400, { error: "Bad Request: missing or unknown mcp-session-id" });
           return;
         }
+        if (sessionId !== undefined) touch(sessionId);
         await transport.handleRequest(req, res);
         return;
       }
@@ -238,6 +320,8 @@ export function buildHttpApp(
       else res.end();
     });
   });
+
+  httpServer.on("close", () => clearInterval(sweepTimer));
 
   return { httpServer, sessions };
 }

@@ -68,16 +68,40 @@ async function handle(msg) {
 export function startMcpServer() {
   log(`starting v${SERVER_INFO.version} (protocol ${PROTOCOL_VERSION}, ${listTools().length} tools)`);
   const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
+
+  // tools/call runs are serialized through a FIFO promise chain: hardware/mutating
+  // tools (calibrate, serial monitor, flash) must never overlap. ping/tools/list/
+  // initialize/resources/prompts stay immediate (ADR-263 O2 — a health check must
+  // answer during a long tool run). `toolChain` also lets stdin-close drain the
+  // in-flight call so its response is flushed instead of dropped by process.exit.
+  let toolChain = Promise.resolve();
+
+  const dispatch = (msg) => handle(msg).catch((err) => {
+    if (msg && msg.id !== undefined) error(msg.id, -32603, String(err && err.message || err));
+    log('handler error:', String(err));
+  });
+
   rl.on('line', (line) => {
     const s = line.trim();
     if (!s) return;
     let msg;
     try { msg = JSON.parse(s); } catch { return log('bad JSON line dropped'); }
-    // Fire-and-forget: keep reading stdin while tool calls run (ADR-263 O2).
-    handle(msg).catch((err) => {
-      if (msg && msg.id !== undefined) error(msg.id, -32603, String(err && err.message || err));
-      log('handler error:', String(err));
+    if (msg && msg.method === 'tools/call') {
+      toolChain = toolChain.then(() => dispatch(msg)); // one tool at a time
+    } else {
+      dispatch(msg); // health/list/handshake answer immediately, even mid tool run
+    }
+  });
+
+  rl.on('close', () => {
+    // Wait for any queued/in-flight tool call to settle (its response written)
+    // before exiting — fire-and-forget used to race this and drop the response.
+    toolChain.then(() => {
+      log('stdin closed — exiting');
+      const done = () => process.exit(0);
+      // Pipe writes are async; flush buffered stdout before exit.
+      if (process.stdout.writableLength) process.stdout.once('drain', done);
+      else done();
     });
   });
-  rl.on('close', () => { log('stdin closed — exiting'); process.exit(0); });
 }

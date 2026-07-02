@@ -21,9 +21,13 @@ const METRIC_TERMS = [
 // 'map' additionally must not be a `.map` file suffix or a hyphenated
 // compound ("map-free", "map-reduce") — mAP the metric never appears as either.
 const METRIC_TERMS_SHORT = [/(?<![.\w])map\b(?!-)/, /\bf1\b/, /\bauc\b/, /\biou\b/];
-// Finding/option labels (F1, O2, …) count as labels unless followed by a
-// score context — "F1 score 0.91" stays a metric, "after F7 fixes" does not.
-const LABEL_TOKEN_RE = /\b[fo]\d+\b(?!\s*(?:score|=|\d|%))/g;
+// Finding/option labels (F1, O2, …) count as labels unless the token sits in a
+// metric context: an immediately following score/=/%/digit or colon ("F1: 0.91"),
+// or a number later in the same clause ("F1 reaches 0.91" — an F1-score claim).
+// Bare option refs ("F7 fixes", "O1–O9", "ADR-263 O2") carry no clause number of
+// their own and stay labels. (A surviving 'f1' still only fires as a metric when
+// its scrubbed line actually carries a number — see mentionsMetricTerm.)
+const LABEL_TOKEN_RE = /\b[fo]\d+\b(?!\s*(?:score|=|\d|%|:))(?![^\n.;]*\d)/g;
 const CODE_SPAN_RE = /`[^`]*`/g; // backticked identifiers are code, not claims
 const HAS_NUMBER_RE = /\d/;
 
@@ -95,9 +99,14 @@ export function claimCheck(text) {
       return;
     }
 
-    // A quantitative claim needs a number: a metric term in plain prose
-    // ("precision matters here") is not a taggable claim (ADR-263 F11).
-    if (!hasPercent && !HAS_NUMBER_RE.test(scrubbed)) return;
+    // A quantitative claim needs a number. Digits hidden in a code span still
+    // count — "accuracy reached `0.95`" is a claim — so test the line with only
+    // finding/option labels stripped, NOT the code-span-scrubbed copy: scrubbing
+    // dropped `0.95` and wrongly short-circuited both the untagged and the
+    // MEASURED-without-reproducer checks below. A bare metric word in prose
+    // ("precision matters here", "every accuracy number must be MEASURED") has no
+    // number and is not a taggable claim (ADR-263 F11).
+    if (!hasPercent && !HAS_NUMBER_RE.test(lower.replace(LABEL_TOKEN_RE, ' '))) return;
 
     // A metric/percent with no honesty tag at all.
     if (!tagged) {
@@ -111,7 +120,8 @@ export function claimCheck(text) {
       return;
     }
 
-    // Tagged MEASURED but cites no reproducer — still a gap.
+    // Tagged MEASURED but cites no reproducer — still a gap (reached now even
+    // when the only number is inside a code span, e.g. "accuracy `0.97` (MEASURED)").
     if (lower.includes('measured') && !hasReproducer) {
       findings.push({
         severity: 'medium',

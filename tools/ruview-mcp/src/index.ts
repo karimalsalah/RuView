@@ -31,6 +31,9 @@
  */
 
 import { createRequire } from "node:module";
+import { realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { argv } from "node:process";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -355,7 +358,26 @@ async function main(): Promise<void> {
   );
 }
 
-main().catch((e) => {
-  process.stderr.write(`[ruview-mcp] Fatal: ${String(e)}\n`);
-  process.exit(1);
-});
+// CLI guard: boot the server only when this module is the entrypoint — invoked
+// as the `rvagent` / `ruview-mcp` bin or `node dist/index.js`. Importing it as a
+// library (`import { buildServer } from "@ruvnet/rvagent"`) must NOT side-effect
+// connect a StdioServerTransport to the consumer's stdin/stdout. Realpath both
+// sides because npm's bin shim is a symlink and passes a non-normalized,
+// possibly case-skewed argv[1] on Windows (mirrors harness/ruview/bin/cli.js).
+const invokedDirectly = (() => {
+  if (!argv[1]) return false;
+  try {
+    const a = realpathSync(argv[1]);
+    const b = realpathSync(fileURLToPath(import.meta.url));
+    return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+  } catch {
+    return false;
+  }
+})();
+
+if (invokedDirectly) {
+  main().catch((e) => {
+    process.stderr.write(`[ruview-mcp] Fatal: ${String(e)}\n`);
+    process.exit(1);
+  });
+}

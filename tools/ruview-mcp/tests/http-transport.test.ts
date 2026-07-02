@@ -110,6 +110,19 @@ describe("isOriginAllowed()", () => {
     expect(isOriginAllowed("https://evil.example.com:443", [])).toBe(false);
   });
 
+  // ADR-264 F7 hardening: an EXPLICIT allowlist means exact matching only. The
+  // any-port-localhost convenience applies solely to the empty-allowlist case,
+  // so an operator who pins an allowlist actually gets it.
+  it("with an explicit allowlist, rejects a localhost origin on an unlisted port", () => {
+    expect(isOriginAllowed("http://localhost:5173", allow)).toBe(false);
+    expect(isOriginAllowed("http://127.0.0.1:8080", allow)).toBe(false);
+  });
+
+  it("with an explicit allowlist, still accepts an exactly-listed localhost origin", () => {
+    expect(isOriginAllowed("http://localhost", allow)).toBe(true);
+    expect(isOriginAllowed("http://127.0.0.1", allow)).toBe(true);
+  });
+
   it("is case-sensitive for non-local allowlist entries per RFC 6454", () => {
     expect(isOriginAllowed("HTTPS://Partner.Example.com", ["https://partner.example.com"])).toBe(false);
   });
@@ -227,5 +240,70 @@ describe("HTTP transport session + body-cap hardening (ADR-264 F7)", () => {
     const r = await post(port, "/mcp", { Accept: "application/json, text/event-stream" }, init);
     expect([200, 406]).not.toContain(0); // sanity
     expect(r.status).toBe(200);
+  });
+});
+
+// ── 8. ADR-264 F7: session-map bounds (cap + idle TTL sweep) ───────────────
+
+describe("HTTP transport session bounds (ADR-264 F7)", () => {
+  const initBody = (id: number): string =>
+    JSON.stringify({
+      jsonrpc: "2.0",
+      id,
+      method: "initialize",
+      params: {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: { name: "test-client", version: "0.0.0" },
+      },
+    });
+
+  // Build directly (not via startServer) so we can inspect the sessions map.
+  async function startWithApp(
+    opts: Parameters<typeof buildHttpApp>[1],
+    basePort: number
+  ): Promise<{
+    port: number;
+    sessions: ReturnType<typeof buildHttpApp>["sessions"];
+    close: () => Promise<void>;
+  }> {
+    const { httpServer, sessions } = buildHttpApp(() => makeMockMcpServer(), opts);
+    const port = basePort + Math.floor(Math.random() * 100);
+    await new Promise<void>((resolve, reject) => {
+      httpServer.once("error", reject);
+      httpServer.listen(port, "127.0.0.1", () => resolve());
+    });
+    const close = () =>
+      new Promise<void>((res, rej) => httpServer.close((e) => (e ? rej(e) : res())));
+    return { port, sessions, close };
+  }
+
+  const ACCEPT = { Accept: "application/json, text/event-stream" };
+
+  it("never exceeds maxSessions — evicts the oldest-idle session at capacity", async () => {
+    const srv = await startWithApp({ allowedOrigins: ["*"], maxSessions: 2 }, 49800);
+    try {
+      for (let i = 0; i < 5; i++) {
+        await post(srv.port, "/mcp", ACCEPT, initBody(i));
+      }
+      expect(srv.sessions.size).toBeLessThanOrEqual(2);
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it("sweeps sessions idle beyond sessionIdleMs", async () => {
+    const srv = await startWithApp(
+      { allowedOrigins: ["*"], sessionIdleMs: 20, sweepIntervalMs: 10 },
+      49900
+    );
+    try {
+      await post(srv.port, "/mcp", ACCEPT, initBody(1));
+      expect(srv.sessions.size).toBe(1);
+      await new Promise((r) => setTimeout(r, 150));
+      expect(srv.sessions.size).toBe(0);
+    } finally {
+      await srv.close();
+    }
   });
 });

@@ -76,10 +76,18 @@ export const jobStatusSchema = z.object({
 export type JobStatusInput = z.infer<typeof jobStatusSchema>;
 
 interface JobRecord {
-  status: "queued" | "running" | "done" | "failed";
+  status: "queued" | "running" | "done" | "failed" | "unknown";
   log_path: string;
   queued_at: number;
   epochs_total: number;
+  /**
+   * OS pid of the training child. Persisted so a later process (e.g. after an
+   * MCP server restart) can tell whether a job still marked 'running' actually
+   * outlived the process that spawned it (ADR-264 O6).
+   */
+  pid?: number | undefined;
+  /** Human-readable explanation attached during reconciliation (unknown state). */
+  reason?: string | undefined;
 }
 
 // In-process job registry, mirrored to <jobsDir>/<id>.json on every state
@@ -113,10 +121,39 @@ function loadPersistedJob(jobsDir: string, jobId: string): JobRecord | undefined
       log_path: raw.log_path,
       queued_at: typeof raw.queued_at === "number" ? raw.queued_at : 0,
       epochs_total: typeof raw.epochs_total === "number" ? raw.epochs_total : 0,
+      pid: typeof raw.pid === "number" ? raw.pid : undefined,
+      reason: typeof raw.reason === "string" ? raw.reason : undefined,
     };
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Is `pid` still a live process? `process.kill(pid, 0)` sends no signal but
+ * probes existence: ESRCH ⇒ gone; EPERM ⇒ alive but owned by another user
+ * (treated as alive so we never falsely reconcile a still-running job).
+ */
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/**
+ * Scan log lines (tail) for the "# exit code: N" marker the child.on('close')
+ * handler appends. `found:false` means the process died without the marker —
+ * i.e. this server never saw the close (it restarted mid-run).
+ */
+function findExitMarker(lines: string[]): { found: boolean; code: number | null } {
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const m = /^# exit code: (-?\d+|null)$/.exec((lines[i] ?? "").trim());
+    if (m) return { found: true, code: m[1] === "null" ? null : Number(m[1]) };
+  }
+  return { found: false, code: null };
 }
 
 /** Read the last `maxLines` lines of a file without loading the whole log. */
@@ -207,6 +244,10 @@ export async function trainCount(
   closeSync(logFdOut);
   closeSync(logFdErr);
 
+  // Record the child pid so a later process can reconcile a stale 'running'
+  // record after a server restart (child.pid is undefined only if spawn failed
+  // synchronously, in which case the 'error' handler flips status to 'failed').
+  record.pid = child.pid;
   record.status = "running";
   persistJob(logDir, jobId, record);
 
@@ -244,12 +285,39 @@ export async function jobStatus(
   config: RuviewConfig
 ): Promise<object> {
   // Memory first, then the persisted record (survives server restarts).
-  const job = jobRegistry.get(input.job_id) ?? loadPersistedJob(config.jobsDir, input.job_id);
+  let job = jobRegistry.get(input.job_id) ?? loadPersistedJob(config.jobsDir, input.job_id);
   if (!job) {
     return {
       ok: false,
       error: `Job ${input.job_id} not found in this server or in ${config.jobsDir}.`,
     };
+  }
+
+  // Reconcile a 'running' record whose owning process is gone. The status flip
+  // to done/failed lives only in the spawning process's child.on('close'/'error')
+  // handlers; if this server restarted mid-run, the record froze at 'running'
+  // (ADR-264 O6). When the pid is dead, recover the true outcome from the log's
+  // "# exit code: N" marker, else surface an honest 'unknown'.
+  if (job.status === "running" && typeof job.pid === "number" && !isProcessAlive(job.pid)) {
+    let tail: string[] = [];
+    try {
+      tail = tailLines(job.log_path, 40);
+    } catch {
+      /* log unreadable — treated as no marker below */
+    }
+    const marker = findExitMarker(tail);
+    const reconciled: JobRecord = { ...job };
+    if (marker.found) {
+      reconciled.status = marker.code === 0 ? "done" : "failed";
+      reconciled.reason = undefined;
+    } else {
+      reconciled.status = "unknown";
+      reconciled.reason =
+        "process gone, no exit marker — server likely restarted mid-run";
+    }
+    jobRegistry.set(input.job_id, reconciled);
+    persistJob(config.jobsDir, input.job_id, reconciled);
+    job = reconciled;
   }
 
   // Bounded tail read — never load a multi-GB training log wholesale.
@@ -266,6 +334,7 @@ export async function jobStatus(
     log_path: job.log_path,
     recent_log: recentLog,
     epochs_total: job.epochs_total,
+    ...(job.reason !== undefined ? { reason: job.reason } : {}),
   };
 
   return { ok: true, result };

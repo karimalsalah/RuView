@@ -32,8 +32,9 @@ export function findRepoRoot(start = process.cwd()) {
   return null;
 }
 
-// Dep-free PATH scan, memoized for the process lifetime (ADR-263 O8) — no
-// shell subprocess per lookup.
+// Dep-free PATH scan (ADR-263 O8) — no shell subprocess per lookup. Only hits
+// are memoized: a miss can resolve later in a long-lived MCP session (the
+// operator installs python/the CLI mid-run), so misses are re-probed each call.
 const whichCache = new Map();
 export function which(cmd) {
   if (whichCache.has(cmd)) return whichCache.get(cmd);
@@ -54,7 +55,7 @@ export function which(cmd) {
       } catch { /* keep scanning */ }
     }
   }
-  whichCache.set(cmd, found);
+  if (found !== null) whichCache.set(cmd, found);
   return found;
 }
 

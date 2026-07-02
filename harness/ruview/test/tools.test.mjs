@@ -4,8 +4,9 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readdirSync, readFileSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { readdirSync, readFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { join, dirname, delimiter } from 'node:path';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { claimCheck, summarize } from '../src/guardrails.js';
 import { TOOLS, TOOL_ALIASES, runTool, listTools, findRepoRoot, run, which } from '../src/tools.js';
@@ -56,6 +57,33 @@ test('guardrail still catches real short-token metric claims', () => {
   assert.equal(claimCheck('We reach mAP 62.3 on COCO.').ok, false);
   assert.equal(claimCheck('F1 score of 0.91 on the held set.').ok, false, 'f1 with a real score must still fire');
   assert.equal(claimCheck('IoU 0.75 across rooms.').ok, false);
+});
+
+// Digits hidden in a code span still make a claim — scrubbing must not blind the
+// number gate to `0.95` (regression: code-span number bypassed the gate).
+test('guardrail flags an accuracy number stated inside a code span', () => {
+  const r = claimCheck('Count accuracy reached `0.95` in our tests.');
+  assert.equal(r.ok, false, JSON.stringify(r.findings));
+  assert.ok(r.findings.some((f) => /not tagged/i.test(f.reason)));
+});
+
+// A MEASURED claim whose only number hides in a code span must still reach the
+// missing-reproducer check (regression: the scrubbed gate short-circuited it).
+// Bare metric prose with no number at all (e.g. the README rule text) stays a pass.
+test('guardrail flags a MEASURED code-span number with no reproducer', () => {
+  const r = claimCheck('Detection accuracy `0.97` on the set (MEASURED).');
+  assert.equal(r.ok, false, JSON.stringify(r.findings));
+  assert.ok(r.findings.some((f) => /no reproducer/i.test(f.reason)));
+  assert.equal(claimCheck('Every accuracy number must be MEASURED against a baseline.').ok, true);
+});
+
+// F1-score phrasings ("F1: 0.91", "F1 reaches 0.91") were scrubbed as option
+// labels and slipped through; option refs alone must still not false-positive.
+test('guardrail catches F1-score claims but not bare option refs (ADR-263 F11)', () => {
+  assert.equal(claimCheck('F1: 0.91 on the held-out set.').ok, false, 'F1: value is a metric claim');
+  assert.equal(claimCheck('F1 reaches 0.91 on the held-out set.').ok, false, 'F1 with a nearby number is a claim');
+  assert.equal(claimCheck('Options O1–O9 are tracked in ADR-263 O2.').ok, true, 'option labels are not metrics');
+  assert.equal(claimCheck('ADR-263 O2 lands the exports fix.').ok, true);
 });
 
 test('summarize gives PASS/finding text', () => {
@@ -156,10 +184,29 @@ test('run() bounds captured output instead of dying on big streams (ADR-263 O4)'
   assert.ok(r.stdout.includes('TAIL_MARKER'), 'tail must keep the end of the stream');
 });
 
-test('which() finds node and memoizes misses', () => {
+test('which() finds node and re-probes misses (hits are cached)', () => {
   assert.ok(which('node'), 'node must be on PATH in the test env');
   assert.equal(which('definitely-not-a-binary-xyz'), null);
-  assert.equal(which('definitely-not-a-binary-xyz'), null); // cached path
+  assert.equal(which('definitely-not-a-binary-xyz'), null); // re-probed, still absent
+});
+
+// ADR-263 O8: a miss must not be cached — an operator who installs a tool
+// mid-session (e.g. python after a python_missing failure) must be found next call.
+test('which() re-probes after a miss so a newly-installed tool is found', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ruview-which-'));
+  const name = 'ruview-probe-xyz';
+  const isWin = process.platform === 'win32';
+  const bin = join(dir, isWin ? `${name}.cmd` : name);
+  const prevPath = process.env.PATH;
+  try {
+    assert.equal(which(name), null, 'not on PATH yet → miss');
+    writeFileSync(bin, isWin ? '@echo off\n' : '#!/bin/sh\n', { mode: 0o755 });
+    process.env.PATH = dir + delimiter + prevPath;
+    assert.ok(which(name), 'installed mid-session → the miss must not have been cached');
+  } finally {
+    process.env.PATH = prevPath;
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('CLI run(): claim-check exits non-zero on a bad claim', async () => {

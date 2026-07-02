@@ -99,3 +99,50 @@ test('MCP server answers ping while a long tools/call is in flight (ADR-263 O2)'
     rmSync(repo, { recursive: true, force: true });
   }
 });
+
+test('tools/call executions are serialized — two slow calls run sequentially', { skip: !which('python') && !which('python3') ? 'python not on PATH' : false }, async () => {
+  // Two verify.py that each sleep 0.8 s. Serialized ⇒ ~1.6 s+; concurrent ⇒ ~0.8 s.
+  const repo = mkdtempSync(join(tmpdir(), 'ruview-mcp-serial-'));
+  const proofDir = join(repo, 'archive', 'v1', 'data', 'proof');
+  mkdirSync(proofDir, { recursive: true });
+  writeFileSync(join(proofDir, 'verify.py'), 'import time\ntime.sleep(0.8)\nprint("VERDICT: PASS")\n');
+
+  const s = startServer();
+  try {
+    s.send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} });
+    await s.next(1);
+
+    const t0 = Date.now();
+    const a = s.next(20);
+    const b = s.next(21);
+    s.send({ jsonrpc: '2.0', id: 20, method: 'tools/call', params: { name: 'ruview_verify', arguments: { repo } } });
+    s.send({ jsonrpc: '2.0', id: 21, method: 'tools/call', params: { name: 'ruview_verify', arguments: { repo } } });
+    const [ra, rb] = await Promise.all([a, b]);
+    const elapsed = Date.now() - t0;
+
+    assert.equal(JSON.parse(ra.result.content[0].text).verdict, 'PASS');
+    assert.equal(JSON.parse(rb.result.content[0].text).verdict, 'PASS');
+    assert.ok(elapsed > 1400, `two 0.8 s tool calls finished in ${elapsed} ms — they overlapped instead of serializing`);
+  } finally {
+    s.close();
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test('stdin close flushes an in-flight tools/call response before exit', async () => {
+  const child = spawn(process.execPath, [CLI, 'mcp', 'start'], { stdio: ['pipe', 'pipe', 'pipe'] });
+  let out = '';
+  child.stdout.on('data', (d) => { out += d; });
+  const exited = new Promise((res) => child.on('exit', res));
+
+  // Write a tools/call then immediately close stdin. The old fire-and-forget
+  // dispatch raced rl 'close' → process.exit and could drop this response.
+  child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 42, method: 'tools/call', params: { name: 'ruview_onboard', arguments: {} } }) + '\n');
+  child.stdin.end();
+
+  await exited;
+  const msgs = out.trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  const resp = msgs.find((m) => m.id === 42);
+  assert.ok(resp, 'the in-flight tools/call response must be flushed to stdout before exit');
+  assert.equal(resp.result.isError, false);
+});
