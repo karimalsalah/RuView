@@ -65,7 +65,9 @@ import {
   vitalsGetHeartRate,
 } from "./tools/vitals-get-heart-rate.js";
 import { vitalsGetAllSchema, vitalsGetAll } from "./tools/vitals-get-all.js";
-import { createHttpTransport } from "./http-transport.js";
+// NOTE: ./http-transport.js is imported lazily in main() — it chain-loads the
+// SDK's streamableHttp module (~48 ms MEASURED), which the default stdio path
+// never uses.
 
 // Single-source the version from package.json (ADR-264 O8/ADR-265 D3).
 const require = createRequire(import.meta.url);
@@ -223,13 +225,22 @@ export const TOOL_ALIASES: Record<string, string> = {
   "ruview.vitals.get_all": "ruview_vitals_get_all",
 };
 
-/** Advertised JSON Schema, generated from the Zod source (ADR-264 O5). */
+/**
+ * Advertised JSON Schema, generated from the Zod source (ADR-264 O5).
+ * Memoized: schemas are static for the process lifetime, and tools/list is
+ * called once per session (per HTTP session under the session-per-server
+ * model) — no point re-walking the Zod tree each time.
+ */
+const jsonSchemaCache = new Map<string, object>();
 export function toolInputJsonSchema(def: ToolDef): object {
+  const cached = jsonSchemaCache.get(def.name);
+  if (cached !== undefined) return cached;
   const raw = zodToJsonSchema(def.schema, { $refStrategy: "none" }) as Record<
     string,
     unknown
   >;
   delete raw["$schema"];
+  jsonSchemaCache.set(def.name, raw);
   return raw;
 }
 
@@ -324,10 +335,12 @@ async function main(): Promise<void> {
   const transport = new StdioServerTransport();
   await stdioServer.connect(transport);
 
-  // Streamable HTTP transport — explicit opt-in only (ADR-264 O3).
+  // Streamable HTTP transport — explicit opt-in only (ADR-264 O3). Lazily
+  // imported so the stdio path never pays the streamableHttp load cost.
   const httpPort = process.env["RVAGENT_HTTP_PORT"];
   let httpNote = "";
   if (httpPort !== undefined && httpPort !== "") {
+    const { createHttpTransport } = await import("./http-transport.js");
     const { boundAddress } = await createHttpTransport(
       () => buildServer(config),
       { port: Number(httpPort) }
