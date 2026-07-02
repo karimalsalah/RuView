@@ -1,0 +1,78 @@
+# ADR-265 D2 — publish only from CI, with provenance.
+#
+# Manual `npm publish` from laptops stops: this workflow re-runs the ADR-265 D1
+# gate for the selected package and then publishes with npm provenance
+# attestations (OIDC), tying every published version to a public commit +
+# workflow run — the npm-side analogue of the ADR-028 witness bundle.
+#
+# Requires: NPM_TOKEN repo secret (an npm automation token), or npm Trusted
+# Publishing configured for the package (in which case the token is unused).
+
+name: ruview npm release
+
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: 'Package directory to publish'
+        required: true
+        type: choice
+        options:
+          - harness/ruview
+          - tools/ruview-mcp
+      dist_tag:
+        description: 'npm dist-tag'
+        required: false
+        default: 'latest'
+        type: string
+
+permissions:
+  contents: read
+  id-token: write # npm --provenance
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.package }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install
+        run: |
+          if [ -f package-lock.json ]; then npm ci; else npm install --no-fund --no-audit; fi
+
+      - name: Build (if present)
+        run: npm run build --if-present
+
+      - name: Test
+        run: npm test --if-present
+
+      - name: Pack gate (no maps)
+        run: |
+          npm pack --dry-run --json 2>/dev/null | node -e "
+            const [info] = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+            const maps = info.files.filter((f) => f.path.endsWith('.map'));
+            if (maps.length > 0) {
+              console.error('Tarball contains source maps (ADR-264 F2):', maps.map((m) => m.path));
+              process.exit(1);
+            }
+            console.log(\`pack gate OK: \${info.files.length} files, \${info.unpackedSize} B unpacked\`);
+          "
+
+      - name: Claim-check README
+        run: |
+          if [ -f README.md ]; then
+            node "$GITHUB_WORKSPACE/harness/ruview/bin/cli.js" claim-check --file README.md
+          fi
+
+      - name: Publish (with provenance)
+        run: npm publish --provenance --access public --tag "${{ inputs.dist_tag }}"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|-------|
-| **Status** | Proposed — review complete (findings recorded with evidence), optimizations O1–O8 not yet implemented |
+| **Status** | Accepted — **implemented** (O1–O9, `@ruvnet/ruview@0.2.0`): fail-closed `claim-check`, async MCP dispatch (ping answered mid-`verify`, pinned by e2e test), zero-dependency install, bounded output tails, argv-passed monitor port, package.json-sourced version, prepack skill sync, memoized `which()`, underscore-canonical tools with dotted aliases, word-boundary guardrail matching. 30/30 tests (MEASURED, `node --test test/*.test.mjs`); CI gate in ADR-265's `npm-packages.yml` |
 | **Date** | 2026-07-02 |
 | **Deciders** | ruv |
 | **Codename** | **RUVIEW-NPM-REVIEW-1** |

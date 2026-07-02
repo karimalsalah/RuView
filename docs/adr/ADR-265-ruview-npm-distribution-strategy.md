@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|-------|
-| **Status** | Proposed |
+| **Status** | Accepted — **D1–D4 implemented**: `.github/workflows/npm-packages.yml` (matrix gate: tests, version-literal grep, pack-content/size gate, tarball-install smoke test, README claim-check), `.github/workflows/ruview-npm-release.yml` (publish-from-CI with `npm publish --provenance`), version single-sourcing (all three packages read package.json), `ruview` bin owned by `@ruvnet/ruview` (`@ruv/ruview-cli` bin renamed `ruview-cli`), `ci.yml` NODE_VERSION 18→20. D5 (no workspace) stands as recorded |
 | **Date** | 2026-07-02 |
 | **Deciders** | ruv |
 | **Codename** | **RUVIEW-NPM-DIST** |
@@ -35,8 +35,7 @@ Cross-cutting facts established during the ADR-263/264 reviews:
 - **No provenance.** Neither published package carries npm provenance
   attestations, in a project whose differentiator is signed, reproducible
   evidence (ADR-028 witness bundles, ADR-182 P4 ed25519/SLSA design).
-- **No pack-content gate.** ADR-264 F1/F2 (broken `require` target, 33% dead
-  map weight — MEASURED, ADR-264 F2 tarball listing — and a phantom
+- **No pack-content gate.** ADR-264 F1/F2 (broken `require` target, 33% dead map weight — MEASURED, tarball listing — and a phantom
   `CHANGELOG.md` in `files`) are exactly the defect class an
   `npm pack --dry-run` assertion catches in seconds.
 
@@ -50,8 +49,10 @@ in ADR-263/264; this ADR fixes the machinery around them.
 Matrix over `[harness/ruview, tools/ruview-mcp, tools/ruview-cli]` ×
 Node `[20, 22]`:
 
-1. `npm ci` (lockfiles are already committed for the TS packages; add one for
-   the harness — it has no prod deps after ADR-263 O3, so the lockfile is tiny).
+1. `npm ci` where a lockfile is committed (the TS packages); the harness
+   installs with `npm install` — repo policy gitignores lockfiles under
+   `harness/`, and the package is dependency-free after ADR-263 O3 so there is
+   nothing to pin.
 2. `npm test` (harness: `node --test test/*.test.mjs` — pin the glob form,
    the directory form fails on Node 22; TS packages: build + jest or `node:test`
    per ADR-264 O8).

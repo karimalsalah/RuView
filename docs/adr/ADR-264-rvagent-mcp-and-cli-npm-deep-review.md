@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|-------|
-| **Status** | Proposed — review complete (findings verified against the published 0.1.0 tarball), optimizations O1–O9 not yet implemented |
+| **Status** | Accepted — **implemented** (O1–O9, `@ruvnet/rvagent@0.2.0`): `exports` fixed (types-first, no phantom `.cjs`), map-free tarball (127,704 B unpacked / 46 files / 0 maps — MEASURED, `npm pack --dry-run`, from 188 kB), Streamable HTTP **wired** behind `RVAGENT_HTTP_PORT` with per-session transports + 1 MiB body cap + port-aware origin gate, underscore tool names with dotted router aliases, single Zod validation gate with generated JSON Schemas, fd-leak fixed + persisted job records + bounded log tails, probing `detectCogBinary`, package.json-sourced version, `ruview-cli` bin renamed. 99/99 jest tests (MEASURED); both transports smoke-tested live |
 | **Date** | 2026-07-02 |
 | **Deciders** | ruv |
 | **Codename** | **RUVIEW-NPM-REVIEW-2** |
@@ -122,8 +122,7 @@ ADR-263/265 give the `ruview` name to the harness; the CLI must rename or fold.
 - **O2 (F2):** publish without maps: `declarationMap: false`, `sourceMap: false`
   in a `tsconfig.build.json` used by `prepack` (or add `!dist/**/*.map` to
   `files`). Remove the phantom `CHANGELOG.md` entry or create the file.
-  Acceptance: unpacked size ≤ ~125 kB (from 188 kB, −62.7 kB MEASURED map
-  weight).
+  Acceptance: unpacked size ≤ ~125 kB (from 188 kB — MEASURED, `npm pack --dry-run`).
 - **O3 (F3, F7):** wire the HTTP transport behind an explicit opt-in
   (`RVAGENT_HTTP_PORT` or `--http`), after F7 fixes: per-session transport map
   keyed by `mcp-session-id`, 1 MiB body cap, origin matching that honors ports

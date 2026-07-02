@@ -17,7 +17,16 @@
 
 import { z } from "zod";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, appendFileSync, openSync } from "node:fs";
+import {
+  mkdirSync,
+  appendFileSync,
+  openSync,
+  closeSync,
+  readFileSync,
+  writeFileSync,
+  statSync,
+  readSync,
+} from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import type { RuviewConfig, TrainJobResult, JobStatusResult } from "../types.js";
@@ -66,17 +75,64 @@ export const jobStatusSchema = z.object({
 
 export type JobStatusInput = z.infer<typeof jobStatusSchema>;
 
-// In-process job registry (survives for the lifetime of the MCP server process).
-// For a production implementation, persist to ~/.ruview/jobs/<id>.json.
-const jobRegistry = new Map<
-  string,
-  {
-    status: "queued" | "running" | "done" | "failed";
-    log_path: string;
-    queued_at: number;
-    epochs_total: number;
+interface JobRecord {
+  status: "queued" | "running" | "done" | "failed";
+  log_path: string;
+  queued_at: number;
+  epochs_total: number;
+}
+
+// In-process job registry, mirrored to <jobsDir>/<id>.json on every state
+// change so ruview_job_status survives an MCP server restart (ADR-264 O6).
+const jobRegistry = new Map<string, JobRecord>();
+
+function jobRecordPath(jobsDir: string, jobId: string): string {
+  return path.join(jobsDir, `${jobId}.json`);
+}
+
+function persistJob(jobsDir: string, jobId: string, record: JobRecord): void {
+  try {
+    writeFileSync(
+      jobRecordPath(jobsDir, jobId),
+      JSON.stringify({ job_id: jobId, ...record }, null, 2)
+    );
+  } catch {
+    // Persistence is best-effort; the in-memory record still serves this process.
   }
->();
+}
+
+function loadPersistedJob(jobsDir: string, jobId: string): JobRecord | undefined {
+  try {
+    const raw = JSON.parse(readFileSync(jobRecordPath(jobsDir, jobId), "utf8")) as
+      Partial<JobRecord>;
+    if (typeof raw.log_path !== "string" || typeof raw.status !== "string") {
+      return undefined;
+    }
+    return {
+      status: raw.status,
+      log_path: raw.log_path,
+      queued_at: typeof raw.queued_at === "number" ? raw.queued_at : 0,
+      epochs_total: typeof raw.epochs_total === "number" ? raw.epochs_total : 0,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/** Read the last `maxLines` lines of a file without loading the whole log. */
+function tailLines(filePath: string, maxLines: number, maxBytes = 64 * 1024): string[] {
+  const size = statSync(filePath).size;
+  const start = Math.max(0, size - maxBytes);
+  const buf = Buffer.alloc(size - start);
+  const fd = openSync(filePath, "r");
+  try {
+    readSync(fd, buf, 0, buf.length, start);
+  } finally {
+    closeSync(fd);
+  }
+  const lines = buf.toString("utf8").split("\n");
+  return lines.slice(Math.max(0, lines.length - maxLines));
+}
 
 export async function trainCount(
   input: TrainCountInput,
@@ -92,13 +148,16 @@ export async function trainCount(
   const outputDir =
     input.output_dir ?? "v2/crates/cog-person-count/cog/artifacts";
 
-  // Record the job immediately so ruview_job_status can find it.
-  jobRegistry.set(jobId, {
+  // Record the job immediately so ruview_job_status can find it — in memory
+  // and on disk (survives server restarts, ADR-264 O6).
+  const record: JobRecord = {
     status: "queued",
     log_path: logPath,
     queued_at: queuedAt,
     epochs_total: input.epochs,
-  });
+  };
+  jobRegistry.set(jobId, record);
+  persistJob(logDir, jobId, record);
 
   // Write the header synchronously so the log file exists before spawn.
   const header = [
@@ -142,21 +201,25 @@ export async function trainCount(
 
   child.unref(); // Allow the MCP server process to exit without waiting for training.
 
-  const entry = jobRegistry.get(jobId);
-  if (entry) {
-    entry.status = "running";
-  }
+  // The child holds its own duplicates of the log fds; close the parent's
+  // copies immediately or every job leaks 2 fds for the server's lifetime
+  // (ADR-264 F6/O6).
+  closeSync(logFdOut);
+  closeSync(logFdErr);
+
+  record.status = "running";
+  persistJob(logDir, jobId, record);
 
   child.on("error", (e) => {
     appendFileSync(logPath, `\n# ERROR: ${e.message}\n`);
-    const rec = jobRegistry.get(jobId);
-    if (rec) rec.status = "failed";
+    record.status = "failed";
+    persistJob(logDir, jobId, record);
   });
 
   child.on("close", (code) => {
     appendFileSync(logPath, `\n# exit code: ${code}\n`);
-    const rec = jobRegistry.get(jobId);
-    if (rec) rec.status = code === 0 ? "done" : "failed";
+    record.status = code === 0 ? "done" : "failed";
+    persistJob(logDir, jobId, record);
   });
 
   const result: TrainJobResult = {
@@ -178,24 +241,21 @@ export async function trainCount(
 
 export async function jobStatus(
   input: JobStatusInput,
-  _config: RuviewConfig
+  config: RuviewConfig
 ): Promise<object> {
-  const job = jobRegistry.get(input.job_id);
+  // Memory first, then the persisted record (survives server restarts).
+  const job = jobRegistry.get(input.job_id) ?? loadPersistedJob(config.jobsDir, input.job_id);
   if (!job) {
     return {
       ok: false,
-      error: `Job ${input.job_id} not found. ` +
-        "The MCP server may have restarted — check the log directory directly.",
+      error: `Job ${input.job_id} not found in this server or in ${config.jobsDir}.`,
     };
   }
 
-  // Read the last 20 lines of the log file.
+  // Bounded tail read — never load a multi-GB training log wholesale.
   let recentLog: string[] = [];
   try {
-    const { readFileSync } = await import("node:fs");
-    const content = readFileSync(job.log_path, "utf8");
-    const lines = content.split("\n");
-    recentLog = lines.slice(Math.max(0, lines.length - 20));
+    recentLog = tailLines(job.log_path, 20);
   } catch {
     recentLog = ["(log not readable yet)"];
   }
