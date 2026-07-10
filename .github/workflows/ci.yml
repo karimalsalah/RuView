@@ -83,8 +83,6 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-      with:
-        submodules: recursive
       # ADR-262 P1: `wifi-densepose-rufield` path-deps the `vendor/rufield`
       # submodule. Without a recursive checkout the workspace build fails to
       # resolve those path deps in CI even though it passes locally.
