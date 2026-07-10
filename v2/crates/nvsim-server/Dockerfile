@@ -61,4 +61,7 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=5s \
     CMD curl -fsS http://localhost:7878/api/health || exit 1
 
 ENTRYPOINT ["nvsim-server"]
+# `-p` requires this 0.0.0.0 bind. The image has no default bearer token:
+# operators MUST pass `-e NVSIM_TOKEN=<secret>` before exposing the mapped port
+# beyond a trusted host; the server warns at runtime when no token is set.
 CMD ["--listen", "0.0.0.0:7878"]

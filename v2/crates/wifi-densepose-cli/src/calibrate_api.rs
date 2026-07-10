@@ -17,8 +17,9 @@
 //! A single background task owns the UDP socket (ESP32 `0xC511_0001` frames) and
 //! the optional active recorder; the HTTP handlers communicate with it over an
 //! mpsc command channel and read a shared status snapshot. This keeps the
-//! `&mut` recorder lock-free and the API non-blocking. CORS is permissive so a
-//! browser UI served from any origin can call it during development.
+//! `&mut` recorder lock-free and the API non-blocking. CORS is fully permissive
+//! only on the default local (`127.0.0.1`/`localhost`) bind; a non-default
+//! `--http-bind` gets a narrower explicit GET/POST-only policy instead.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -27,7 +28,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use axum::{
     extract::{Query, State},
-    http::StatusCode,
+    http::{header, Method, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -36,7 +37,7 @@ use clap::Args;
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, RwLock};
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use wifi_densepose_calibration::extract::{AnchorFeature, Features};
 use wifi_densepose_calibration::{
     AnchorLabel, AnchorQualityGate, AnchorRecorder, MixtureOfSpecialists, NodeGeometry,
@@ -291,7 +292,16 @@ async fn require_bearer(
 
 /// Build the API router (without the optional auth layer). Shared by `execute`
 /// and the integration tests.
-fn build_router(state: ApiState) -> Router {
+fn build_router(state: ApiState, local_only: bool) -> Router {
+    let cors = if local_only {
+        CorsLayer::permissive()
+    } else {
+        CorsLayer::new()
+            .allow_methods([Method::GET, Method::POST])
+            .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+            .allow_origin(AllowOrigin::any())
+    };
+
     Router::new()
         .route("/", get(descriptor))
         .route("/api/v1/calibration/health", get(health))
@@ -305,7 +315,7 @@ fn build_router(state: ApiState) -> Router {
         .route("/api/v1/enroll/anchor", post(enroll_anchor))
         .route("/api/v1/enroll/geometry", post(enroll_geometry))
         .route("/api/v1/enroll/status", get(enroll_status))
-        .layer(CorsLayer::permissive())
+        .layer(cors)
         .with_state(state)
 }
 
@@ -344,7 +354,8 @@ pub async fn execute(args: CalibrateServeArgs) -> Result<()> {
     }
 
     let state = ApiState { cmd_tx, status, window, fs_hz: 15.0, enroll };
-    let mut app = build_router(state);
+    let local_only = args.http_bind == "127.0.0.1" || args.http_bind == "localhost";
+    let mut app = build_router(state, local_only);
 
     // Optional bearer auth — required before any non-loopback exposure.
     if let Some(token) = args.token.clone() {
@@ -1098,9 +1109,36 @@ mod tests {
     #[tokio::test]
     async fn health_and_descriptor_ok() {
         let dir = tempfile::tempdir().unwrap();
-        let app = build_router(test_state(dir.path().to_str().unwrap()));
+        let app = build_router(test_state(dir.path().to_str().unwrap()), true);
         assert_eq!(req(app.clone(), "GET", "/", None).await, StatusCode::OK);
         assert_eq!(req(app, "GET", "/api/v1/calibration/health", None).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn nonlocal_cors_allows_only_api_methods_and_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = build_router(test_state(dir.path().to_str().unwrap()), false);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/api/v1/calibration/health")
+                    .header("origin", "https://example.com")
+                    .header("access-control-request-method", "DELETE")
+                    .header("access-control-request-headers", "x-custom")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.headers().get("access-control-allow-origin").unwrap(), "*");
+        assert_eq!(response.headers().get("access-control-allow-methods").unwrap(), "GET,POST");
+        assert_eq!(
+            response.headers().get("access-control-allow-headers").unwrap(),
+            "authorization,content-type"
+        );
+        assert!(response.headers().get("access-control-allow-credentials").is_none());
     }
 
     #[tokio::test]
@@ -1114,7 +1152,7 @@ mod tests {
                 w.push_back((2.0 * std::f32::consts::PI * 0.3 * i as f32 / 15.0).sin());
             }
         }
-        let app = build_router(state);
+        let app = build_router(state, true);
 
         // POST /room/train with two anchors → bank persisted as t.json.
         let body = r#"{"room_id":"t","baseline_id":"b","anchors":[
@@ -1146,7 +1184,7 @@ mod tests {
     #[tokio::test]
     async fn train_threads_geometry_into_bank() {
         let dir = tempfile::tempdir().unwrap();
-        let app = build_router(test_state(dir.path().to_str().unwrap()));
+        let app = build_router(test_state(dir.path().to_str().unwrap()), true);
         let anchors = r#"[
             {"room_id":"g","label":"empty","features":{"mean":1.0,"variance":1.0,"motion":0.1,"breathing_score":0.0,"breathing_hz":0.0,"heart_score":0.0,"heart_hz":0.0}},
             {"room_id":"g","label":"stand_still","features":{"mean":1.0,"variance":10.0,"motion":0.2,"breathing_score":0.0,"breathing_hz":0.0,"heart_score":0.0,"heart_hz":0.0}}
@@ -1196,7 +1234,7 @@ mod tests {
     #[tokio::test]
     async fn enroll_status_empty_and_bad_label() {
         let dir = tempfile::tempdir().unwrap();
-        let app = build_router(test_state(dir.path().to_str().unwrap()));
+        let app = build_router(test_state(dir.path().to_str().unwrap()), true);
         // No enrollment yet → 200 with next=empty.
         assert_eq!(req(app.clone(), "GET", "/api/v1/enroll/status?room=x", None).await, StatusCode::OK);
         // Unknown anchor label → 400.
