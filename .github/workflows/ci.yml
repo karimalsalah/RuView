@@ -139,8 +139,15 @@ jobs:
         CARGO_PROFILE_TEST_DEBUG: "0"
       run: cargo test --workspace --no-default-features
 
+    # `wifi-densepose-worldmodel` lives in the `crates/worldgraph` submodule,
+    # which is its own Cargo workspace and is explicitly `exclude`d from the
+    # outer v2 workspace (see v2/Cargo.toml). Running `-p wifi-densepose-worldmodel`
+    # from `v2` therefore fails with "cannot specify features for packages
+    # outside of workspace" — cargo only honors `--no-default-features` for
+    # packages that are members of the workspace being invoked. Point
+    # working-directory at the submodule's own workspace root instead.
     - name: Run ADR-147 worldmodel tests
-      working-directory: v2
+      working-directory: v2/crates/worldgraph
       env:
         CARGO_PROFILE_DEV_DEBUG: "0"
         CARGO_PROFILE_TEST_DEBUG: "0"
